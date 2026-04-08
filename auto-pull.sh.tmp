@@ -1,0 +1,33 @@
+#!/bin/bash
+set -euo pipefail
+LOG_FILE=/opt/mc/auto-pull.log
+REPO_DIR=/opt/mc/yoda-mission-control
+BRANCH=main
+cd "$REPO_DIR"
+echo "[$(date -Is)] starting auto-pull" >> "$LOG_FILE"
+BEFORE_HEAD=$(git rev-parse HEAD)
+BEFORE_PACKAGE=$(sha256sum package.json 2>/dev/null | awk '{print $1}' || true)
+git fetch origin "$BRANCH" >> "$LOG_FILE" 2>&1
+LOCAL_HEAD=$(git rev-parse HEAD)
+REMOTE_HEAD=$(git rev-parse "origin/$BRANCH")
+if [ "$LOCAL_HEAD" = "$REMOTE_HEAD" ]; then
+  echo "[$(date -Is)] no changes" >> "$LOG_FILE"
+  exit 0
+fi
+git pull --ff-only origin "$BRANCH" >> "$LOG_FILE" 2>&1
+AFTER_HEAD=$(git rev-parse HEAD)
+AFTER_PACKAGE=$(sha256sum package.json 2>/dev/null | awk '{print $1}' || true)
+if [ "$BEFORE_PACKAGE" != "$AFTER_PACKAGE" ]; then
+  echo "[$(date -Is)] package.json changed, running npm install" >> "$LOG_FILE"
+  npm install >> "$LOG_FILE" 2>&1
+fi
+if docker compose version >/dev/null 2>&1 && [ -f docker-compose.yml ]; then
+  echo "[$(date -Is)] restarting via docker compose" >> "$LOG_FILE"
+  docker compose up -d --build >> "$LOG_FILE" 2>&1
+elif command -v pm2 >/dev/null 2>&1 && pm2 list | grep -q yoda-mission-control; then
+  echo "[$(date -Is)] restarting via pm2" >> "$LOG_FILE"
+  pm2 restart yoda-mission-control >> "$LOG_FILE" 2>&1
+else
+  echo "[$(date -Is)] no known process manager found; no restart performed" >> "$LOG_FILE"
+fi
+echo "[$(date -Is)] deployed $BEFORE_HEAD -> $AFTER_HEAD" >> "$LOG_FILE"
