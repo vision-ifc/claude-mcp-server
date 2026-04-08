@@ -1,0 +1,15 @@
+{
+  "name": "claude-openclaw-mcp-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for Claude -> Jarvis/OpenClaw integration on Mac Mini",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@linear/sdk": "^80.0.0",
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
