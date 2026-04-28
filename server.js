@@ -141,6 +141,7 @@ function publicTask(task) {
     status: task.status,
     statusMessage: task.statusMessage,
     createdAt: task.createdAt,
+    lastUpdatedAt: task.updatedAt,
     ttl: task.ttl,
     pollInterval: task.pollInterval
   };
