@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
-import { hostname } from "node:os";
-import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync } from "node:fs";
-import { spawn, execFile } from "node:child_process";
+import { hostname, homedir, userInfo } from "node:os";
+import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -36,6 +36,14 @@ const JARVIS_STATUS_LOGS = {
   gateway: "/Users/jarvis/.openclaw/logs/gateway.log",
   mcpServer: "/Users/jarvis/.openclaw/logs/mcp-server.log",
   sshTunnel: "/Users/jarvis/.openclaw/logs/mcp-tunnel.log"
+};
+const ALLOWED_SERVICES = {
+  "com.jarvis.mcp-server": "~/Library/LaunchAgents/com.jarvis.mcp-server.plist",
+  "ai.openclaw.gateway": "~/Library/LaunchAgents/ai.openclaw.gateway.plist",
+  "ai.openclaw.coding": "~/Library/LaunchAgents/ai.openclaw.coding.plist",
+  "com.jarvis.mcp-tunnel": "~/Library/LaunchAgents/com.jarvis.mcp-tunnel.plist",
+  "com.openclaw.yoda-dedup": "~/Library/LaunchAgents/com.openclaw.yoda-dedup.plist",
+  "com.openclaw.caffeinate": "~/Library/LaunchAgents/com.openclaw.caffeinate.plist"
 };
 
 if (!API_KEY || !OPENCLAW_TOKEN || !OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) process.exit(1);
@@ -244,10 +252,167 @@ async function collectJarvisStatus(options = {}) {
   const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
   return Promise.race([collectJarvisStatusCore({ include_logs: includeLogs, log_lines: logLines }), timeoutSnapshot]);
 }
+
+function expandAllowedServicePath(plistPath) {
+  return plistPath.startsWith("~/") ? `${homedir()}/${plistPath.slice(2)}` : plistPath;
+}
+
+function launchctlDomain() { return `gui/${userInfo().uid}`; }
+
+function runLaunchctl(args) {
+  try {
+    const stdout = execFileSync("launchctl", args, { encoding: "utf8", timeout: 10000, maxBuffer: 1024 * 1024 });
+    return { ok: true, code: 0, stdout, stderr: "" };
+  } catch (error) {
+    return { ok: false, code: error.status ?? 1, stdout: error.stdout?.toString?.() || "", stderr: error.stderr?.toString?.() || error.message || "" };
+  }
+}
+
+function getServicePid(serviceLabel) {
+  try {
+    const raw = execFileSync("launchctl", ["list"], { encoding: "utf8", timeout: 2000, maxBuffer: 1024 * 1024 });
+    const line = raw.split(/\r?\n/).find(row => row.trim().endsWith(`\t${serviceLabel}`) || row.trim().endsWith(` ${serviceLabel}`));
+    if (!line) return null;
+    const pid = line.trim().split(/\s+/)[0];
+    return pid === "-" ? null : Number(pid);
+  } catch { return null; }
+}
+
+function bootoutBootstrapService(service, plistPath, oldPid) {
+  runLaunchctl(["bootout", launchctlDomain(), plistPath]);
+  const boot = runLaunchctl(["bootstrap", launchctlDomain(), plistPath]);
+  const newPid = getServicePid(service);
+  if (!boot.ok) return { ok: false, status: "failed", method: "bootout-bootstrap", service, oldPid, newPid, error: boot.stderr || boot.stdout || "bootstrap failed" };
+  return { ok: true, status: "restarted", method: "bootout-bootstrap", service, oldPid, newPid };
+}
+
+function restartServiceImpl(service, mode = "kickstart") {
+  const configuredPath = ALLOWED_SERVICES[service];
+  if (!configuredPath) return { ok: false, error: "service not in allowlist", service };
+  const plistPath = expandAllowedServicePath(configuredPath);
+  const oldPid = getServicePid(service);
+  if (service === "com.jarvis.mcp-server") {
+    const helper = spawn("/bin/sh", ["-c", `sleep 2 && launchctl bootout ${launchctlDomain()} ${plistPath} 2>/dev/null; sleep 3 && launchctl bootstrap ${launchctlDomain()} ${plistPath}`], { detached: true, stdio: "ignore" });
+    helper.unref();
+    return { ok: true, status: "self_restart_initiated", service, helperPid: helper.pid, plistPath };
+  }
+  if (mode === "bootout-bootstrap") return bootoutBootstrapService(service, plistPath, oldPid);
+  const kick = runLaunchctl(["kickstart", "-k", `${launchctlDomain()}/${service}`]);
+  const newPid = getServicePid(service);
+  if (kick.ok) return { ok: true, status: "restarted", method: "kickstart", service, oldPid, newPid };
+  const err = `${kick.stderr}
+${kick.stdout}`;
+  if (/Could not find service|service not loaded/i.test(err)) return bootoutBootstrapService(service, plistPath, oldPid);
+  return { ok: false, status: "failed", method: "kickstart", service, oldPid, newPid, error: kick.stderr || kick.stdout || "kickstart failed" };
+}
 async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
 
 function requireMcpAuth(req, res) { const token = getBearerToken(req); if (!validateAccessToken(token)) { res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`, ...corsHeaders() }); res.end(JSON.stringify({ error: "unauthorized" })); return false; } return true; }
-function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000) { return new Promise((resolve, reject) => { const args = ["gateway", "call", method, "--timeout", String(timeoutMs), "--params", JSON.stringify(params), "--token", OPENCLAW_TOKEN, "--url", `ws://127.0.0.1:${OPENCLAW_PORT}`]; if (expectFinal) args.splice(3, 0, "--expect-final"); const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = ""; child.stdout.on("data", d => stdout += d.toString()); child.stderr.on("data", d => stderr += d.toString()); child.on("error", reject); child.on("close", code => code !== 0 ? reject(new Error(stderr.trim() || stdout.trim() || `gateway call failed (${code})`)) : resolve((stdout || stderr).trim())); }); }
+function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000, { useCoding = false } = {}) {
+  const port = useCoding && OPENCLAW_CODING_PORT ? OPENCLAW_CODING_PORT : OPENCLAW_PORT;
+  const token = useCoding && OPENCLAW_CODING_TOKEN ? OPENCLAW_CODING_TOKEN : OPENCLAW_TOKEN;
+  return new Promise((resolve, reject) => {
+    const args = ["gateway", "call", method, "--timeout", String(timeoutMs), "--params", JSON.stringify(params), "--token", token, "--url", `ws://127.0.0.1:${port}`];
+    if (expectFinal) args.splice(3, 0, "--expect-final");
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(killer); fn(val); };
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(reject, new Error(`gateway call killed after ${timeoutMs + 2000}ms (openclaw CLI ignored --timeout)`)); }, timeoutMs + 2000);
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", err => finish(reject, err));
+    child.on("close", code => code !== 0 ? finish(reject, new Error(stderr.trim() || stdout.trim() || `gateway call failed (${code})`)) : finish(resolve, (stdout || stderr).trim()));
+  });
+}
+
+function runEmbeddedAgent(agentId, task, timeoutMs = 60000) {
+  const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
+  return new Promise((resolve, reject) => {
+    const args = ["agent", "--agent", agentId, "-m", task, "--json", "--timeout", String(timeoutSec)];
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(killer); fn(val); };
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(reject, new Error(`embedded agent killed after ${timeoutMs + 2000}ms`)); }, timeoutMs + 2000);
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", err => finish(reject, err));
+    child.on("close", () => {
+      const startIdx = stdout.indexOf('{');
+      const endIdx = stdout.lastIndexOf('}');
+      if (startIdx < 0 || endIdx < 0) return finish(reject, new Error(stderr.trim() || "embedded agent failed: no JSON output"));
+      const jsonStr = stdout.substring(startIdx, endIdx + 1);
+      try {
+        const result = JSON.parse(jsonStr);
+        const reply = (result && result.payloads && result.payloads[0] && result.payloads[0].text) || (result && result.meta && result.meta.finalAssistantVisibleText) || null;
+        finish(resolve, { raw: jsonStr, reply });
+      } catch (e) {
+        finish(reject, new Error("embedded agent JSON parse failed: " + e.message));
+      }
+    });
+  });
+}
+
+async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKey, waitForReply = true, timeoutMs = 30000 }) {
+  const jobId = randomUUID();
+  const key = sessionKey || `agent:${agentId}:main`;
+  const previousReply = getLatestAssistantReply(key);
+  const params = { key, message: task };
+  recordJob({ id: jobId, type: "dispatch_agent", status: "running", request: params });
+  const taskMatch = task.match(/\b(IFC-\d+)\b/);
+  const taskLabel = taskMatch ? taskMatch[1] : "(no-ticket)";
+  updateAgentStatus(agentId, "working", taskLabel);
+  try {
+    let raw, reply = null;
+    try {
+      raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 30000));
+      reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
+    } catch (gatewayError) {
+      if (waitForReply) {
+        const fb = await runEmbeddedAgent(agentId, task, timeoutMs);
+        raw = fb.raw;
+        reply = fb.reply;
+      } else {
+        const fb = await runEmbeddedAgent(agentId, task, timeoutMs);
+        raw = fb.raw;
+        reply = null;
+      }
+    }
+    const job = recordJob({ id: jobId, type: "dispatch_agent", status: reply || !waitForReply ? "completed" : "started", request: params, raw, reply });
+    updateAgentStatus(agentId, "idle", taskLabel);
+    return { ok: true, jobId, sessionKey: key, reply, raw: job.raw };
+  } catch (error) {
+    recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: error.message });
+    updateAgentStatus(agentId, "idle", taskLabel);
+    return { ok: false, jobId, error: error.message };
+  }
+}
+
+async function directToolCall(name, args = {}) {
+  if (name === "list_agents") return { ok: true, agents: listAgentStatuses() };
+  if (name === "get_completions") return { ok: true, completions: getCompletions(args.agent) };
+  if (name === "get_agent_output") return readLatestAssistantText(args.sessionKey);
+  if (name === "jarvis_restart_service") return restartServiceImpl(args.service, args.mode || "kickstart");
+  if (name === "dispatch_agent") return dispatchAgentDirect(args);
+  return { ok: false, error: `unknown tool: ${name}` };
+}
+
+function taskToolResult(result) {
+  if (result?.content) return result;
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+}
+
+function getAuthContextFromToolExtra(extra = {}) {
+  if (extra.sessionId && authContextsBySession.has(extra.sessionId)) return authContextsBySession.get(extra.sessionId);
+  const token = extra.requestInfo?.headers?.authorization?.startsWith("Bearer ") ? extra.requestInfo.headers.authorization.slice(7) : extra.requestInfo?.headers?.["x-api-key"] || "";
+  return getAuthContextForToken(token) || { type: "mcp-tool", clientId: "anonymous" };
+}
+
+async function callTaskRpcTool(method, params = {}, extra = {}) {
+  if (!sessionSupportsTasks(extra.sessionId)) return { content: [{ type: "text", text: TASK_TOOL_REQUIRES_TASKS_MESSAGE }], isError: true };
+  const response = await handleTaskRpc({ jsonrpc: "2.0", id: "tool", method, params }, getAuthContextFromToolExtra(extra), extra.sessionId);
+  if (response?.error) return { content: [{ type: "text", text: JSON.stringify(response.error, null, 2) }], isError: true };
+  return taskToolResult(response.result);
+}
 
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
@@ -297,6 +462,10 @@ function buildServer() {
   server.tool("jarvis_status", "Returns a structured snapshot of Jarvis OpenClaw + MCP infrastructure state — launchd services, listening ports, running processes, recent logs (with secrets redacted), agent session metadata, and health roll-ups. Read-only; no mutations.", { include_logs: z.boolean().optional().default(false), log_lines: z.number().int().min(0).max(200).optional().default(50) }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ include_logs, log_lines }, extra) => {
     const snapshot = await collectJarvisStatus({ include_logs, log_lines });
     return { content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }], structuredContent: snapshot };
+  });
+  server.tool("jarvis_restart_service", "Restart a Jarvis-supervised LaunchAgent (kickstart preferred; bootout+bootstrap fallback). Allowlist enforced.", { service: z.enum(["com.jarvis.mcp-server", "ai.openclaw.gateway", "ai.openclaw.coding", "com.jarvis.mcp-tunnel", "com.openclaw.yoda-dedup", "com.openclaw.caffeinate"]), mode: z.enum(["kickstart", "bootout-bootstrap"]).optional() }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }, async ({ service, mode }) => {
+    const result = restartServiceImpl(service, mode || "kickstart");
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   });
   server.tool("get_completions", "Get recent agent completions, optionally filtered by agent.", { agent: z.string().optional() }, async ({ agent }) => {
     const completions = getCompletions(agent);
