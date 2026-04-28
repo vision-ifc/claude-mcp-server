@@ -120,10 +120,26 @@ function runReadOnlyCommand(command, args, timeoutMs = 2000) {
   return Promise.race([commandResult, new Promise(resolve => setTimeout(() => resolve(null), timeoutMs))]);
 }
 
+function stripJsoncComments(raw) {
+  let out = "", inStr = false, esc = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (esc) { out += c; esc = false; continue; }
+    if (c === "\\" && inStr) { out += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; out += c; continue; }
+    if (!inStr && c === "/" && raw[i + 1] === "/") {
+      while (i < raw.length && raw[i] !== "\n") i++;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 function parseOpenClawConfig() {
   try {
     const raw = readFileSync(OPENCLAW_CONFIG_FILE, "utf8");
-    const cleaned = raw.replace(/\/\/[^\n]*/g, "").replace(/,(\s*[}\]])/g, "$1");
+    const cleaned = stripJsoncComments(raw).replace(/,(\s*[}\]])/g, "$1");
     return JSON.parse(cleaned);
   } catch { return null; }
 }
