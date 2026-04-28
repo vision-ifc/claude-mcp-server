@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
-import { hostname } from "node:os";
+import { hostname, homedir, userInfo } from "node:os";
 import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -64,6 +64,14 @@ const JARVIS_STATUS_LOGS = {
   gateway: "/Users/jarvis/.openclaw/logs/gateway.log",
   mcpServer: "/Users/jarvis/.openclaw/logs/mcp-server.log",
   sshTunnel: "/Users/jarvis/.openclaw/logs/mcp-tunnel.log"
+};
+const ALLOWED_SERVICES = {
+  "com.jarvis.mcp-server": "~/Library/LaunchAgents/com.jarvis.mcp-server.plist",
+  "ai.openclaw.gateway": "~/Library/LaunchAgents/ai.openclaw.gateway.plist",
+  "ai.openclaw.coding": "~/Library/LaunchAgents/ai.openclaw.coding.plist",
+  "com.jarvis.mcp-tunnel": "~/Library/LaunchAgents/com.jarvis.mcp-tunnel.plist",
+  "com.openclaw.yoda-dedup": "~/Library/LaunchAgents/com.openclaw.yoda-dedup.plist",
+  "com.openclaw.caffeinate": "~/Library/LaunchAgents/com.openclaw.caffeinate.plist"
 };
 
 if (!API_KEY || !OPENCLAW_TOKEN || !OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) process.exit(1);
@@ -304,6 +312,59 @@ async function collectJarvisStatus(options = {}) {
   const timeoutMs = includeLogs && logLines === 200 ? 30000 : 10000;
   const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
   return Promise.race([collectJarvisStatusCore({ include_logs: includeLogs, log_lines: logLines }), timeoutSnapshot]);
+}
+
+function expandAllowedServicePath(plistPath) {
+  return plistPath.startsWith("~/") ? `${homedir()}/${plistPath.slice(2)}` : plistPath;
+}
+
+function launchctlDomain() { return `gui/${userInfo().uid}`; }
+
+function runLaunchctl(args) {
+  try {
+    const stdout = execFileSync("launchctl", args, { encoding: "utf8", timeout: 10000, maxBuffer: 1024 * 1024 });
+    return { ok: true, code: 0, stdout, stderr: "" };
+  } catch (error) {
+    return { ok: false, code: error.status ?? 1, stdout: error.stdout?.toString?.() || "", stderr: error.stderr?.toString?.() || error.message || "" };
+  }
+}
+
+function getServicePid(serviceLabel) {
+  try {
+    const raw = execFileSync("launchctl", ["list"], { encoding: "utf8", timeout: 2000, maxBuffer: 1024 * 1024 });
+    const line = raw.split(/\r?\n/).find(row => row.trim().endsWith(`\t${serviceLabel}`) || row.trim().endsWith(` ${serviceLabel}`));
+    if (!line) return null;
+    const pid = line.trim().split(/\s+/)[0];
+    return pid === "-" ? null : Number(pid);
+  } catch { return null; }
+}
+
+function bootoutBootstrapService(service, plistPath, oldPid) {
+  runLaunchctl(["bootout", launchctlDomain(), plistPath]);
+  const boot = runLaunchctl(["bootstrap", launchctlDomain(), plistPath]);
+  const newPid = getServicePid(service);
+  if (!boot.ok) return { ok: false, status: "failed", method: "bootout-bootstrap", service, oldPid, newPid, error: boot.stderr || boot.stdout || "bootstrap failed" };
+  return { ok: true, status: "restarted", method: "bootout-bootstrap", service, oldPid, newPid };
+}
+
+function restartServiceImpl(service, mode = "kickstart") {
+  const configuredPath = ALLOWED_SERVICES[service];
+  if (!configuredPath) return { ok: false, error: "service not in allowlist", service };
+  const plistPath = expandAllowedServicePath(configuredPath);
+  const oldPid = getServicePid(service);
+  if (service === "com.jarvis.mcp-server") {
+    const helper = spawn("/bin/sh", ["-c", `sleep 2 && launchctl bootout ${launchctlDomain()} ${plistPath} 2>/dev/null; sleep 3 && launchctl bootstrap ${launchctlDomain()} ${plistPath}`], { detached: true, stdio: "ignore" });
+    helper.unref();
+    return { ok: true, status: "self_restart_initiated", service, helperPid: helper.pid, plistPath };
+  }
+  if (mode === "bootout-bootstrap") return bootoutBootstrapService(service, plistPath, oldPid);
+  const kick = runLaunchctl(["kickstart", "-k", `${launchctlDomain()}/${service}`]);
+  const newPid = getServicePid(service);
+  if (kick.ok) return { ok: true, status: "restarted", method: "kickstart", service, oldPid, newPid };
+  const err = `${kick.stderr}
+${kick.stdout}`;
+  if (/Could not find service|service not loaded/i.test(err)) return bootoutBootstrapService(service, plistPath, oldPid);
+  return { ok: false, status: "failed", method: "kickstart", service, oldPid, newPid, error: kick.stderr || kick.stdout || "kickstart failed" };
 }
 async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
 function updateAgentStatus(agentId, status, task) {
@@ -614,6 +675,7 @@ async function directToolCall(name, args = {}) {
   if (name === "list_agents") return { ok: true, agents: listAgentStatuses() };
   if (name === "get_completions") return { ok: true, completions: getCompletions(args.agent) };
   if (name === "get_agent_output") return readLatestAssistantText(args.sessionKey);
+  if (name === "jarvis_restart_service") return restartServiceImpl(args.service, args.mode || "kickstart");
   if (name === "dispatch_agent") return dispatchAgentDirect(args);
   return { ok: false, error: `unknown tool: ${name}` };
 }
@@ -691,6 +753,10 @@ function buildServer() {
   server.tool("jarvis_status", "Returns a structured snapshot of Jarvis OpenClaw + MCP infrastructure state — launchd services, listening ports, running processes, recent logs (with secrets redacted), agent session metadata, and health roll-ups. Read-only; no mutations.", { include_logs: z.boolean().optional().default(false), log_lines: z.number().int().min(0).max(200).optional().default(50) }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ include_logs, log_lines }, extra) => {
     const snapshot = await collectJarvisStatus({ include_logs, log_lines });
     return { content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }], structuredContent: snapshot };
+  });
+  server.tool("jarvis_restart_service", "Restart a Jarvis-supervised LaunchAgent (kickstart preferred; bootout+bootstrap fallback). Allowlist enforced.", { service: z.enum(["com.jarvis.mcp-server", "ai.openclaw.gateway", "ai.openclaw.coding", "com.jarvis.mcp-tunnel", "com.openclaw.yoda-dedup", "com.openclaw.caffeinate"]), mode: z.enum(["kickstart", "bootout-bootstrap"]).optional() }, { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }, async ({ service, mode }) => {
+    const result = restartServiceImpl(service, mode || "kickstart");
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   });
   server.tool("get_completions", "Get recent agent completions, optionally filtered by agent.", { agent: z.string().optional() }, async ({ agent }) => {
     const completions = getCompletions(agent);
