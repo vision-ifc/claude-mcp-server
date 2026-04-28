@@ -194,15 +194,6 @@ function markRunning(taskId, childPid) { return updateTask(taskId, { status: "wo
 function markCompleted(taskId, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "completed", statusMessage: "Task completed successfully.", result, error: null, completedAt: new Date().toISOString(), childPid: null }); }
 function markFailed(taskId, error, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "failed", statusMessage: error?.message || String(error), result: result || null, error: error?.message || String(error), completedAt: new Date().toISOString(), childPid: null }); }
 function markCancelled(taskId) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "cancelled", statusMessage: "The task was cancelled by request.", completedAt: new Date().toISOString(), childPid: null }); }
-async function waitForTaskTerminal(taskId) {
-  const started = Date.now();
-  while (Date.now() - started < TASK_TTL_MS) {
-    const task = getTask(taskId);
-    if (!task || ["completed", "failed", "cancelled"].includes(task.status)) return task;
-    await sleep(Math.min(task.pollInterval || TASK_POLL_INTERVAL_MS, 5000));
-  }
-  return getTask(taskId);
-}
 function cancelTask(taskId) {
   const task = getTask(taskId);
   if (!task) return null;
@@ -294,9 +285,7 @@ async function handleTaskRpc(body, authContext) {
     return { result: publicTask(cancelTask(params.taskId)), jsonrpc: "2.0", id: body.id ?? null };
   }
   if (body.method === "tasks/result") {
-    let task = getTask(params.taskId);
-    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
-    if (!["completed", "failed", "cancelled"].includes(task.status)) task = await waitForTaskTerminal(params.taskId);
+    const task = getTask(params.taskId);
     if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
     if (!["completed", "failed", "cancelled"].includes(task.status)) return { error: { code: -32001, message: `Task is not complete (status: ${task.status})` }, jsonrpc: "2.0", id: body.id ?? null };
     if (task.status === "cancelled") return { result: { content: [{ type: "text", text: JSON.stringify({ ok: false, taskId: task.taskId, status: "cancelled" }, null, 2) }], isError: true, _meta: { "io.modelcontextprotocol/related-task": { taskId: task.taskId } } }, jsonrpc: "2.0", id: body.id ?? null };
