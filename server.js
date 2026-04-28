@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
-import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -33,6 +33,9 @@ const OPENCLAW_AGENTS_DIR = "/Users/jarvis/.openclaw/agents";
 const OAUTH_STATE_FILE = "/Users/jarvis/.openclaw/workspace-yoda/claude-mcp-server/.oauth-state.json";
 const AGENT_STATUS_DIR = "/Users/jarvis/.openclaw/workspace-yoda/agent-status";
 const AGENT_COMPLETIONS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/logs/agent-completions.json";
+const TASKS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/claude-mcp-server/.tasks.json";
+const TASK_TTL_MS = Number(process.env.MCP_TASK_TTL_MS || 24 * 60 * 60 * 1000);
+const TASK_POLL_INTERVAL_MS = Number(process.env.MCP_TASK_POLL_INTERVAL_MS || 2000);
 
 if (!API_KEY || !OPENCLAW_TOKEN || !OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) process.exit(1);
 
@@ -45,6 +48,8 @@ const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
 const activeSseBySession = new Map();
+const activeTaskChildren = new Map();
+let taskState = { tasks: [] };
 
 function logLine(message) { const line = `[${new Date().toISOString()}] ${message}`; console.log(line); try { appendFileSync(LOG_FILE, `${line}\n`); } catch {} }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
@@ -83,7 +88,9 @@ function loadOauthState() {
 registeredClients.set(OAUTH_CLIENT_ID, { client_id: OAUTH_CLIENT_ID, client_secret: OAUTH_CLIENT_SECRET, redirect_uris: [], token_endpoint_auth_method: "client_secret_post", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], client_name: "Jarvis Claude Connector" });
 loadOauthState();
 
-function validateAccessToken(token) { if (!token) return false; if (token === API_KEY) return true; const stored = accessTokens.get(token); if (!stored) return false; if (stored.expiresAt <= nowSeconds()) { accessTokens.delete(token); saveOauthState(); return false; } return true; }
+function getAuthContextForToken(token) { if (!token) return null; if (token === API_KEY) return { type: "api-key", clientId: "static-api-key" }; const stored = accessTokens.get(token); if (!stored) return null; if (stored.expiresAt <= nowSeconds()) { accessTokens.delete(token); saveOauthState(); return null; } return { type: "oauth", clientId: stored.clientId || "unknown-oauth-client" }; }
+function getAuthContext(req) { return getAuthContextForToken(getBearerToken(req)); }
+function validateAccessToken(token) { return !!getAuthContextForToken(token); }
 function issueAccessToken(clientId) { const accessToken = randomToken(32); const refreshToken = randomToken(32); const expiresAt = nowSeconds() + OAUTH_ACCESS_TOKEN_TTL_SECONDS; accessTokens.set(accessToken, { accessToken, clientId, expiresAt }); refreshTokens.set(refreshToken, { clientId, expiresAt: nowSeconds() + 30 * 24 * 3600 }); saveOauthState(); return { access_token: accessToken, token_type: "Bearer", expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: "mcp" }; }
 function recordJob(job) { const full = { ...job, updatedAt: new Date().toISOString() }; jobs.set(job.id, full); return full; }
 function getSessionIdForKey(sessionKey) { const agentId = sessionKey.split(":")[1]; const p = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`; if (!existsSync(p)) return null; const data = JSON.parse(readFileSync(p, "utf8")); return data?.[sessionKey]?.sessionId || null; }
@@ -97,6 +104,207 @@ function updateAgentStatus(agentId, status, task) {
     spawn("bash", ["/Users/jarvis/.openclaw/workspace-yoda/scripts/update-agent-status.sh", "--agent", agentId, "--status", status, "--task", task], { stdio: "ignore", detached: true }).unref();
   } catch {}
 }
+
+
+function loadTasks() {
+  try {
+    if (!existsSync(TASKS_FILE)) { taskState = { tasks: [] }; return; }
+    const loaded = JSON.parse(readFileSync(TASKS_FILE, "utf8"));
+    taskState = { tasks: Array.isArray(loaded?.tasks) ? loaded.tasks : [] };
+    const now = Date.now();
+    let changed = false;
+    taskState.tasks = taskState.tasks.filter(task => {
+      const created = Date.parse(task.createdAt || 0);
+      return !Number.isFinite(created) || !task.ttl || now - created <= task.ttl;
+    }).map(task => {
+      if (task.status === "working" && !task.completedAt) {
+        changed = true;
+        return { ...task, status: "failed", statusMessage: "MCP server restarted before task completed.", error: "MCP server restarted before task completed.", completedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), childPid: null };
+      }
+      return task;
+    });
+    if (changed) persistTasks();
+  } catch (e) {
+    logLine(`Task state load error: ${e.message}`);
+    taskState = { tasks: [] };
+  }
+}
+function persistTasks() {
+  const tmp = `${TASKS_FILE}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(taskState, null, 2));
+  renameSync(tmp, TASKS_FILE);
+}
+function publicTask(task) {
+  if (!task) return null;
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    statusMessage: task.statusMessage,
+    createdAt: task.createdAt,
+    ttl: task.ttl,
+    pollInterval: task.pollInterval
+  };
+}
+function assertTaskAccess(task, authContext) {
+  return task && task.clientId === (authContext?.clientId || "anonymous");
+}
+function getTask(taskId) { return taskState.tasks.find(task => task.taskId === taskId) || null; }
+function listTasks(filter = {}) {
+  const limit = Math.min(Math.max(Number(filter.limit || 20), 1), 100);
+  const visible = taskState.tasks
+    .filter(task => !filter.clientId || task.clientId === filter.clientId)
+    .filter(task => !filter.status || task.status === filter.status)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const start = filter.cursor ? Math.max(visible.findIndex(task => task.taskId === filter.cursor) + 1, 0) : 0;
+  const page = visible.slice(start, start + limit);
+  return { tasks: page.map(publicTask), nextCursor: start + limit < visible.length ? page[page.length - 1]?.taskId : undefined };
+}
+function createTask({ agentId, sessionKey, request, authContext, ttl }) {
+  const now = new Date().toISOString();
+  const task = {
+    taskId: randomUUID(),
+    sessionKey,
+    agentId,
+    request,
+    status: "working",
+    statusMessage: "The operation is now in progress.",
+    createdAt: now,
+    updatedAt: now,
+    completedAt: null,
+    result: null,
+    error: null,
+    childPid: null,
+    clientId: authContext?.clientId || "anonymous",
+    authType: authContext?.type || "unknown",
+    ttl: Math.min(Number(ttl || TASK_TTL_MS), TASK_TTL_MS),
+    pollInterval: TASK_POLL_INTERVAL_MS
+  };
+  taskState.tasks.push(task);
+  persistTasks();
+  return task;
+}
+function updateTask(taskId, patch) {
+  const task = getTask(taskId);
+  if (!task) return null;
+  Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+  persistTasks();
+  return task;
+}
+function markRunning(taskId, childPid) { return updateTask(taskId, { status: "working", statusMessage: "The operation is now in progress.", childPid: childPid || null }); }
+function markCompleted(taskId, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "completed", statusMessage: "Task completed successfully.", result, error: null, completedAt: new Date().toISOString(), childPid: null }); }
+function markFailed(taskId, error, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "failed", statusMessage: error?.message || String(error), result: result || null, error: error?.message || String(error), completedAt: new Date().toISOString(), childPid: null }); }
+function markCancelled(taskId) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "cancelled", statusMessage: "The task was cancelled by request.", completedAt: new Date().toISOString(), childPid: null }); }
+async function waitForTaskTerminal(taskId) {
+  const started = Date.now();
+  while (Date.now() - started < TASK_TTL_MS) {
+    const task = getTask(taskId);
+    if (!task || ["completed", "failed", "cancelled"].includes(task.status)) return task;
+    await sleep(Math.min(task.pollInterval || TASK_POLL_INTERVAL_MS, 5000));
+  }
+  return getTask(taskId);
+}
+function cancelTask(taskId) {
+  const task = getTask(taskId);
+  if (!task) return null;
+  const child = activeTaskChildren.get(taskId);
+  if (child) { try { child.kill("SIGKILL"); } catch {} }
+  return markCancelled(taskId);
+}
+function isTaskAugmentedCall(body) {
+  if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent") return false;
+  return !!(body.params.task || body.params?._meta?.["modelcontextprotocol.io/task"] || body.params?._meta?.["io.modelcontextprotocol/task"] || body._meta?.["modelcontextprotocol.io/task"]);
+}
+function callToolResultFromDispatch(result, taskId) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    isError: !result.ok || undefined,
+    _meta: { "io.modelcontextprotocol/related-task": { taskId } }
+  };
+}
+function runEmbeddedAgentForTask(taskRecord, timeoutMs = 60000) {
+  const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
+  const { agentId, request } = taskRecord;
+  return new Promise((resolve, reject) => {
+    const args = ["agent", "--agent", agentId, "-m", request.task, "--json", "--timeout", String(timeoutSec)];
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let settled = false;
+    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(killer); fn(value); };
+    const killer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(reject, new Error(`embedded agent killed after ${timeoutMs + 2000}ms`));
+    }, timeoutMs + 2000);
+    activeTaskChildren.set(taskRecord.taskId, child);
+    markRunning(taskRecord.taskId, child.pid);
+    let stdout = "", stderr = "";
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", err => finish(reject, err));
+    child.on("close", (code, signal) => {
+      if (getTask(taskRecord.taskId)?.status === "cancelled") return finish(resolve, { cancelled: true });
+      if (signal || code !== 0) return finish(reject, new Error(stderr.trim() || `embedded agent exited with ${signal || code}`));
+      const startIdx = stdout.indexOf('{');
+      const endIdx = stdout.lastIndexOf('}');
+      if (startIdx < 0 || endIdx < 0) return finish(reject, new Error(stderr.trim() || "embedded agent failed: no JSON output"));
+      const jsonStr = stdout.substring(startIdx, endIdx + 1);
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const reply = parsed?.payloads?.[0]?.text || parsed?.meta?.finalAssistantVisibleText || null;
+        finish(resolve, { raw: jsonStr, reply });
+      } catch (e) {
+        finish(reject, new Error("embedded agent JSON parse failed: " + e.message));
+      }
+    });
+  });
+}
+function startDispatchTask({ args, authContext, taskParams }) {
+  const agentId = args.agentId || DEFAULT_AGENT_ID;
+  const sessionKey = args.sessionKey || `agent:${agentId}:main`;
+  const taskRecord = createTask({ agentId, sessionKey, request: { ...args, agentId, sessionKey }, authContext, ttl: taskParams?.ttl });
+  runEmbeddedAgentForTask(taskRecord, args.timeoutMs || 30000).then(fb => {
+    if (fb?.cancelled) return;
+    const result = { ok: true, taskId: taskRecord.taskId, sessionKey, reply: fb.reply, raw: fb.raw };
+    markCompleted(taskRecord.taskId, callToolResultFromDispatch(result, taskRecord.taskId));
+  }).catch(error => {
+    const result = callToolResultFromDispatch({ ok: false, taskId: taskRecord.taskId, error: error.message }, taskRecord.taskId);
+    markFailed(taskRecord.taskId, error, result);
+  });
+  return taskRecord;
+}
+function taskCreateResult(task) {
+  return { task: publicTask(task), _meta: { "io.modelcontextprotocol/model-immediate-response": `Task ${task.taskId} accepted. Poll tasks/get, then tasks/result when complete.` } };
+}
+async function handleTaskRpc(body, authContext) {
+  const params = body.params || {};
+  if (isTaskAugmentedCall(body)) {
+    const task = startDispatchTask({ args: params.arguments || {}, authContext, taskParams: params.task || params._meta?.["modelcontextprotocol.io/task"] || body._meta?.["modelcontextprotocol.io/task"] || {} });
+    return { result: taskCreateResult(task), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/get") {
+    const task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: publicTask(task), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/list") {
+    return { result: listTasks({ cursor: params.cursor, limit: params.limit, status: params.status, clientId: authContext?.clientId || "anonymous" }), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/cancel") {
+    const task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    if (["completed", "failed", "cancelled"].includes(task.status)) return { error: { code: -32602, message: `Cannot cancel task in terminal status '${task.status}'` }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: publicTask(cancelTask(params.taskId)), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/result") {
+    let task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    if (!["completed", "failed", "cancelled"].includes(task.status)) task = await waitForTaskTerminal(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    if (!["completed", "failed", "cancelled"].includes(task.status)) return { error: { code: -32001, message: `Task is not complete (status: ${task.status})` }, jsonrpc: "2.0", id: body.id ?? null };
+    if (task.status === "cancelled") return { result: { content: [{ type: "text", text: JSON.stringify({ ok: false, taskId: task.taskId, status: "cancelled" }, null, 2) }], isError: true, _meta: { "io.modelcontextprotocol/related-task": { taskId: task.taskId } } }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: task.result, jsonrpc: "2.0", id: body.id ?? null };
+  }
+  return null;
+}
+loadTasks();
 
 function requireMcpAuth(req, res) { const token = getBearerToken(req); if (!validateAccessToken(token)) { res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`, ...corsHeaders() }); res.end(JSON.stringify({ error: "unauthorized" })); return false; } return true; }
 function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000, { useCoding = false } = {}) {
@@ -121,21 +329,23 @@ function runEmbeddedAgent(agentId, task, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const args = ["agent", "--agent", agentId, "-m", task, "--json", "--timeout", String(timeoutSec)];
     const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "";
+    let stdout = "", stderr = "", settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(killer); fn(val); };
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(reject, new Error(`embedded agent killed after ${timeoutMs + 2000}ms`)); }, timeoutMs + 2000);
     child.stdout.on("data", d => stdout += d.toString());
     child.stderr.on("data", d => stderr += d.toString());
-    child.on("error", reject);
+    child.on("error", err => finish(reject, err));
     child.on("close", () => {
       const startIdx = stdout.indexOf('{');
       const endIdx = stdout.lastIndexOf('}');
-      if (startIdx < 0 || endIdx < 0) return reject(new Error(stderr.trim() || "embedded agent failed: no JSON output"));
+      if (startIdx < 0 || endIdx < 0) return finish(reject, new Error(stderr.trim() || "embedded agent failed: no JSON output"));
       const jsonStr = stdout.substring(startIdx, endIdx + 1);
       try {
         const result = JSON.parse(jsonStr);
         const reply = (result && result.payloads && result.payloads[0] && result.payloads[0].text) || (result && result.meta && result.meta.finalAssistantVisibleText) || null;
-        resolve({ raw: jsonStr, reply });
+        finish(resolve, { raw: jsonStr, reply });
       } catch (e) {
-        reject(new Error("embedded agent JSON parse failed: " + e.message));
+        finish(reject, new Error("embedded agent JSON parse failed: " + e.message));
       }
     });
   });
@@ -153,7 +363,7 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
   try {
     let raw, reply = null;
     try {
-      raw = await runGatewayCall("sessions.send", params, false, 3000);
+      raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 30000));
       reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
     } catch (gatewayError) {
       if (waitForReply) {
@@ -161,10 +371,8 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
         raw = fb.raw;
         reply = fb.reply;
       } else {
-        runEmbeddedAgent(agentId, task, timeoutMs).catch(err => {
-          console.error("[embedded fallback bg error]", err.message);
-        });
-        raw = JSON.stringify({ status: "started", fallback: "embedded", note: "Gateway unavailable; embedded agent dispatched in background. Poll get_agent_output for reply." });
+        const fb = await runEmbeddedAgent(agentId, task, timeoutMs);
+        raw = fb.raw;
         reply = null;
       }
     }
@@ -188,7 +396,8 @@ async function directToolCall(name, args = {}) {
 
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.server.registerCapabilities({ tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } });
+  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
     const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
   });
@@ -287,7 +496,7 @@ const app = http.createServer(async (req, res) => {
       if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
       await transport.handleRequest(req, res); return;
     }
-    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
+    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
     return jsonResponse(res, 405, { error: "method not allowed" }, { Allow: "GET, POST, DELETE, OPTIONS" });
   } catch (error) {
     logLine(`MCP handler error: ${error.stack || error.message}`);
