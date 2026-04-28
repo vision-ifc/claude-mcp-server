@@ -17,11 +17,17 @@ const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 2592000);
 const OPENCLAW_BASE_URL = (process.env.OPENCLAW_BASE_URL || "ws://127.0.0.1:18789").replace(/\/$/, "");
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || "";
+const OPENCLAW_CODING_BASE_URL = (process.env.OPENCLAW_CODING_BASE_URL || "").replace(/\/$/, "");
+const OPENCLAW_CODING_TOKEN = process.env.OPENCLAW_CODING_TOKEN || "";
 const DEFAULT_AGENT_ID = process.env.DEFAULT_AGENT_ID || "artoo";
 const LINEAR_API_KEY = process.env.LINEAR_API_KEY || "";
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN || "";
 const SLACK_DEFAULT_CHANNEL = process.env.SLACK_DEFAULT_CHANNEL || "";
 const OPENCLAW_PORT = Number(new URL(OPENCLAW_BASE_URL.replace(/^ws/, "http")).port || 18789);
+const OPENCLAW_CODING_PORT = OPENCLAW_CODING_BASE_URL ? Number(new URL(OPENCLAW_CODING_BASE_URL.replace(/^ws/, "http")).port || 18820) : 0;
+
+// Agents that should be routed through the coding gateway (port 18820)
+const CODING_GATEWAY_AGENTS = new Set(["artoo"]);
 const LOG_FILE = "/Users/jarvis/.openclaw/logs/mcp-server.log";
 const OPENCLAW_AGENTS_DIR = "/Users/jarvis/.openclaw/agents";
 const OAUTH_STATE_FILE = "/Users/jarvis/.openclaw/workspace-yoda/claude-mcp-server/.oauth-state.json";
@@ -86,26 +92,118 @@ function readJsonFile(file, fallback) { try { if (!existsSync(file)) return fall
 function listAgentStatuses() { if (!existsSync(AGENT_STATUS_DIR)) return []; return readdirSync(AGENT_STATUS_DIR).filter(name => name.endsWith('.json')).map(name => readJsonFile(`${AGENT_STATUS_DIR}/${name}`, null)).filter(Boolean); }
 function getCompletions(agent) { const completions = readJsonFile(AGENT_COMPLETIONS_FILE, []); const filtered = agent ? completions.filter(entry => entry?.agent === agent) : completions; return filtered.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()); }
 async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
+function updateAgentStatus(agentId, status, task) {
+  try {
+    spawn("bash", ["/Users/jarvis/.openclaw/workspace-yoda/scripts/update-agent-status.sh", "--agent", agentId, "--status", status, "--task", task], { stdio: "ignore", detached: true }).unref();
+  } catch {}
+}
 
 function requireMcpAuth(req, res) { const token = getBearerToken(req); if (!validateAccessToken(token)) { res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`, ...corsHeaders() }); res.end(JSON.stringify({ error: "unauthorized" })); return false; } return true; }
-function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000) { return new Promise((resolve, reject) => { const args = ["gateway", "call", method, "--timeout", String(timeoutMs), "--params", JSON.stringify(params), "--token", OPENCLAW_TOKEN, "--url", `ws://127.0.0.1:${OPENCLAW_PORT}`]; if (expectFinal) args.splice(3, 0, "--expect-final"); const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] }); let stdout = "", stderr = ""; child.stdout.on("data", d => stdout += d.toString()); child.stderr.on("data", d => stderr += d.toString()); child.on("error", reject); child.on("close", code => code !== 0 ? reject(new Error(stderr.trim() || stdout.trim() || `gateway call failed (${code})`)) : resolve((stdout || stderr).trim())); }); }
+function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000, { useCoding = false } = {}) {
+  const port = useCoding && OPENCLAW_CODING_PORT ? OPENCLAW_CODING_PORT : OPENCLAW_PORT;
+  const token = useCoding && OPENCLAW_CODING_TOKEN ? OPENCLAW_CODING_TOKEN : OPENCLAW_TOKEN;
+  return new Promise((resolve, reject) => {
+    const args = ["gateway", "call", method, "--timeout", String(timeoutMs), "--params", JSON.stringify(params), "--token", token, "--url", `ws://127.0.0.1:${port}`];
+    if (expectFinal) args.splice(3, 0, "--expect-final");
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "", settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; clearTimeout(killer); fn(val); };
+    const killer = setTimeout(() => { try { child.kill("SIGKILL"); } catch {} finish(reject, new Error(`gateway call killed after ${timeoutMs + 2000}ms (openclaw CLI ignored --timeout)`)); }, timeoutMs + 2000);
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", err => finish(reject, err));
+    child.on("close", code => code !== 0 ? finish(reject, new Error(stderr.trim() || stdout.trim() || `gateway call failed (${code})`)) : finish(resolve, (stdout || stderr).trim()));
+  });
+}
+
+function runEmbeddedAgent(agentId, task, timeoutMs = 60000) {
+  const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
+  return new Promise((resolve, reject) => {
+    const args = ["agent", "--agent", agentId, "-m", task, "--json", "--timeout", String(timeoutSec)];
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", reject);
+    child.on("close", () => {
+      const startIdx = stdout.indexOf('{');
+      const endIdx = stdout.lastIndexOf('}');
+      if (startIdx < 0 || endIdx < 0) return reject(new Error(stderr.trim() || "embedded agent failed: no JSON output"));
+      const jsonStr = stdout.substring(startIdx, endIdx + 1);
+      try {
+        const result = JSON.parse(jsonStr);
+        const reply = (result && result.payloads && result.payloads[0] && result.payloads[0].text) || (result && result.meta && result.meta.finalAssistantVisibleText) || null;
+        resolve({ raw: jsonStr, reply });
+      } catch (e) {
+        reject(new Error("embedded agent JSON parse failed: " + e.message));
+      }
+    });
+  });
+}
+
+async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKey, waitForReply = true, timeoutMs = 30000 }) {
+  const jobId = randomUUID();
+  const key = sessionKey || `agent:${agentId}:main`;
+  const previousReply = getLatestAssistantReply(key);
+  const params = { key, message: task };
+  recordJob({ id: jobId, type: "dispatch_agent", status: "running", request: params });
+  const taskMatch = task.match(/\b(IFC-\d+)\b/);
+  const taskLabel = taskMatch ? taskMatch[1] : "(no-ticket)";
+  updateAgentStatus(agentId, "working", taskLabel);
+  try {
+    let raw, reply = null;
+    try {
+      raw = await runGatewayCall("sessions.send", params, false, 3000);
+      reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
+    } catch (gatewayError) {
+      if (waitForReply) {
+        const fb = await runEmbeddedAgent(agentId, task, timeoutMs);
+        raw = fb.raw;
+        reply = fb.reply;
+      } else {
+        runEmbeddedAgent(agentId, task, timeoutMs).catch(err => {
+          console.error("[embedded fallback bg error]", err.message);
+        });
+        raw = JSON.stringify({ status: "started", fallback: "embedded", note: "Gateway unavailable; embedded agent dispatched in background. Poll get_agent_output for reply." });
+        reply = null;
+      }
+    }
+    const job = recordJob({ id: jobId, type: "dispatch_agent", status: reply || !waitForReply ? "completed" : "started", request: params, raw, reply });
+    updateAgentStatus(agentId, "idle", taskLabel);
+    return { ok: true, jobId, sessionKey: key, reply, raw: job.raw };
+  } catch (error) {
+    recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: error.message });
+    updateAgentStatus(agentId, "idle", taskLabel);
+    return { ok: false, jobId, error: error.message };
+  }
+}
+
+async function directToolCall(name, args = {}) {
+  if (name === "list_agents") return { ok: true, agents: listAgentStatuses() };
+  if (name === "get_completions") return { ok: true, completions: getCompletions(args.agent) };
+  if (name === "get_agent_output") return { ok: true, sessionKey: args.sessionKey, reply: getLatestAssistantReply(args.sessionKey) };
+  if (name === "dispatch_agent") return dispatchAgentDirect(args);
+  return { ok: false, error: `unknown tool: ${name}` };
+}
 
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+    const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
+  });
+  server.tool("dispatch_coding", "Dispatch a coding task directly to the coding gateway (port 18820). Use for direct exec/tool calls on the coding runtime, not for agent session messages.", { method: z.string().default("sessions.send"), params: z.string().describe("JSON-encoded params object").default("{}"), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ method, params: paramsStr, timeoutMs }) => {
+    const params = JSON.parse(paramsStr);
+    if (!OPENCLAW_CODING_PORT) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Coding gateway not configured" }, null, 2) }], isError: true };
     const jobId = randomUUID();
-    const key = sessionKey || `agent:${agentId}:main`;
-    const previousReply = getLatestAssistantReply(key);
-    const params = { key, message: task };
-    recordJob({ id: jobId, type: "dispatch_agent", status: "running", request: params });
+    recordJob({ id: jobId, type: "dispatch_coding", status: "running", request: { method, params } });
     try {
-      const raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 10000));
-      const reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
-      const job = recordJob({ id: jobId, type: "dispatch_agent", status: reply || !waitForReply ? "completed" : "started", request: params, raw, reply });
-      return { content: [{ type: "text", text: JSON.stringify({ ok: true, jobId, sessionKey: key, reply, raw: job.raw }, null, 2) }] };
+      const raw = await runGatewayCall(method, params, false, timeoutMs, { useCoding: true });
+      recordJob({ id: jobId, type: "dispatch_coding", status: "completed", request: { method, params }, raw });
+      return { content: [{ type: "text", text: JSON.stringify({ ok: true, jobId, gateway: "coding:18820", raw }, null, 2) }] };
     } catch (error) {
-      recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: error.message });
-      return { content: [{ type: "text", text: JSON.stringify({ ok: false, jobId, error: error.message }, null, 2) }], isError: true };
+      recordJob({ id: jobId, type: "dispatch_coding", status: "failed", request: { method, params }, error: error.message });
+      return { content: [{ type: "text", text: JSON.stringify({ ok: false, jobId, error: error.message, gateway: "coding:18820" }, null, 2) }], isError: true };
     }
   });
   server.tool("check_status", "Check status of a previous MCP job or an OpenClaw session.", { jobId: z.string().optional(), sessionKey: z.string().optional() }, async ({ jobId, sessionKey }) => {
@@ -165,7 +263,7 @@ const app = http.createServer(async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   logLine(`${req.method} ${url.pathname} from ${req.headers["x-forwarded-for"] || req.socket.remoteAddress} | UA: ${(req.headers["user-agent"] || "").slice(0, 120)}`);
   if (req.method === "OPTIONS") { res.writeHead(204, corsHeaders({ "Access-Control-Max-Age": "86400" })); return res.end(); }
-  if (url.pathname === "/healthz") return jsonResponse(res, 200, { ok: true, service: "jarvis-openclaw-mcp", openclawPort: OPENCLAW_PORT, oauth: true });
+  if (url.pathname === "/healthz") return jsonResponse(res, 200, { ok: true, service: "jarvis-openclaw-mcp", openclawPort: OPENCLAW_PORT, codingPort: OPENCLAW_CODING_PORT || null, codingAgents: Array.from(CODING_GATEWAY_AGENTS), oauth: true });
   if (url.pathname === "/.well-known/oauth-protected-resource") return jsonResponse(res, 200, { resource: PUBLIC_BASE_URL, authorization_servers: [PUBLIC_BASE_URL], bearer_methods_supported: ["header"], scopes_supported: ["mcp"] });
   if (url.pathname === "/.well-known/oauth-authorization-server") return jsonResponse(res, 200, { issuer: PUBLIC_BASE_URL, authorization_endpoint: `${PUBLIC_BASE_URL}/authorize`, token_endpoint: `${PUBLIC_BASE_URL}/token`, registration_endpoint: `${PUBLIC_BASE_URL}/register`, response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"], code_challenge_methods_supported: ["S256"], scopes_supported: ["mcp"] });
   if (url.pathname === "/register" && req.method === "POST") { const body = JSON.parse((await parseBody(req)) || "{}"); const clientId = `mcp-${randomToken(12)}`; const clientSecret = randomToken(24); const record = { client_id: clientId, client_secret: clientSecret, client_id_issued_at: nowSeconds(), client_secret_expires_at: 0, redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(isValidRedirectUri) : [], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: body.token_endpoint_auth_method || "client_secret_post", client_name: body.client_name || "Dynamic MCP Client" }; registeredClients.set(clientId, record); saveOauthState(); return jsonResponse(res, 201, record); }
@@ -189,7 +287,7 @@ const app = http.createServer(async (req, res) => {
       if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
       await transport.handleRequest(req, res); return;
     }
-    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
+    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
     return jsonResponse(res, 405, { error: "method not allowed" }, { Allow: "GET, POST, DELETE, OPTIONS" });
   } catch (error) {
     logLine(`MCP handler error: ${error.stack || error.message}`);
