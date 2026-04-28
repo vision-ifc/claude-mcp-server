@@ -56,6 +56,8 @@ const refreshTokens = new Map();
 const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
+const authContextsBySession = new Map();
+const clientSupportsTasksBySession = new Map();
 const activeSseBySession = new Map();
 
 function logLine(message) { const line = `[${new Date().toISOString()}] ${message}`; console.log(line); try { appendFileSync(LOG_FILE, `${line}\n`); } catch {} }
@@ -306,6 +308,229 @@ ${kick.stdout}`;
   return { ok: false, status: "failed", method: "kickstart", service, oldPid, newPid, error: kick.stderr || kick.stdout || "kickstart failed" };
 }
 async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
+function updateAgentStatus(agentId, status, task) {
+  try {
+    spawn("bash", ["/Users/jarvis/.openclaw/workspace-yoda/scripts/update-agent-status.sh", "--agent", agentId, "--status", status, "--task", task], { stdio: "ignore", detached: true }).unref();
+  } catch {}
+}
+
+
+function loadTasks() {
+  try {
+    if (!existsSync(TASKS_FILE)) { taskState = { tasks: [] }; return; }
+    const loaded = JSON.parse(readFileSync(TASKS_FILE, "utf8"));
+    taskState = { tasks: Array.isArray(loaded?.tasks) ? loaded.tasks : [] };
+    const now = Date.now();
+    let changed = false;
+    taskState.tasks = taskState.tasks.filter(task => {
+      const created = Date.parse(task.createdAt || 0);
+      return !Number.isFinite(created) || !task.ttl || now - created <= task.ttl;
+    }).map(task => {
+      if (task.status === "working" && !task.completedAt) {
+        changed = true;
+        return { ...task, status: "failed", statusMessage: "MCP server restarted before task completed.", error: "MCP server restarted before task completed.", completedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), childPid: null };
+      }
+      return task;
+    });
+    if (changed) persistTasks();
+  } catch (e) {
+    logLine(`Task state load error: ${e.message}`);
+    taskState = { tasks: [] };
+  }
+}
+function persistTasks() {
+  const tmp = `${TASKS_FILE}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(taskState, null, 2));
+  renameSync(tmp, TASKS_FILE);
+}
+function publicTask(task) {
+  if (!task) return null;
+  return {
+    taskId: task.taskId,
+    status: task.status,
+    statusMessage: task.statusMessage,
+    createdAt: task.createdAt,
+    lastUpdatedAt: task.updatedAt,
+    ttl: task.ttl,
+    pollInterval: task.pollInterval
+  };
+}
+function assertTaskAccess(task, authContext) {
+  return task && task.clientId === (authContext?.clientId || "anonymous");
+}
+function getTask(taskId) { return taskState.tasks.find(task => task.taskId === taskId) || null; }
+function listTasks(filter = {}) {
+  const limit = Math.min(Math.max(Number(filter.limit || 20), 1), 100);
+  const visible = taskState.tasks
+    .filter(task => !filter.clientId || task.clientId === filter.clientId)
+    .filter(task => !filter.status || task.status === filter.status)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const start = filter.cursor ? Math.max(visible.findIndex(task => task.taskId === filter.cursor) + 1, 0) : 0;
+  const page = visible.slice(start, start + limit);
+  return { tasks: page.map(publicTask), nextCursor: start + limit < visible.length ? page[page.length - 1]?.taskId : undefined };
+}
+function createTask({ agentId, sessionKey, request, authContext, ttl }) {
+  const now = new Date().toISOString();
+  const task = {
+    taskId: randomUUID(),
+    sessionKey,
+    agentId,
+    request,
+    status: "working",
+    statusMessage: "The operation is now in progress.",
+    createdAt: now,
+    updatedAt: now,
+    completedAt: null,
+    result: null,
+    error: null,
+    childPid: null,
+    clientId: authContext?.clientId || "anonymous",
+    authType: authContext?.type || "unknown",
+    ttl: Math.min(Number(ttl || TASK_TTL_MS), TASK_TTL_MS),
+    pollInterval: TASK_POLL_INTERVAL_MS
+  };
+  taskState.tasks.push(task);
+  persistTasks();
+  return task;
+}
+function updateTask(taskId, patch) {
+  const task = getTask(taskId);
+  if (!task) return null;
+  Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+  persistTasks();
+  return task;
+}
+function markRunning(taskId, childPid) { return updateTask(taskId, { status: "working", statusMessage: "The operation is now in progress.", childPid: childPid || null }); }
+function markCompleted(taskId, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "completed", statusMessage: "Task completed successfully.", result, error: null, completedAt: new Date().toISOString(), childPid: null }); }
+function markFailed(taskId, error, result) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "failed", statusMessage: error?.message || String(error), result: result || null, error: error?.message || String(error), completedAt: new Date().toISOString(), childPid: null }); }
+function markCancelled(taskId) { activeTaskChildren.delete(taskId); return updateTask(taskId, { status: "cancelled", statusMessage: "The task was cancelled by request.", completedAt: new Date().toISOString(), childPid: null }); }
+function cancelTask(taskId) {
+  const task = getTask(taskId);
+  if (!task) return null;
+  const child = activeTaskChildren.get(taskId);
+  if (child) { try { child.kill("SIGKILL"); } catch {} }
+  return markCancelled(taskId);
+}
+function isTaskAugmentedCall(body) {
+  if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent") return false;
+  return !!getTaskParams(body);
+}
+function getTaskParams(body) {
+  return body?.params?.task || body?.params?._meta?.["modelcontextprotocol.io/task"] || body?.params?._meta?.["io.modelcontextprotocol/task"] || body?._meta?.["modelcontextprotocol.io/task"] || body?._meta?.["io.modelcontextprotocol/task"] || null;
+}
+const DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS = 50000;
+const LONG_RUNNING_DISPATCH_REQUIRES_TASKS_MESSAGE = "Long-running dispatch (timeoutMs > 50000) requires client-side SEP-1686 task support. Your client did not advertise this capability during initialize. Use timeoutMs <= 50000 for synchronous dispatch.";
+const TASK_TOOL_REQUIRES_TASKS_MESSAGE = "This tasks_* tool requires client-side SEP-1686 task support. Your client did not advertise this capability during initialize.";
+function clientSupportsTasks(capabilities = {}) {
+  return !!(capabilities?.tasks || capabilities?.experimental?.tasks || capabilities?.extensions?.["io.modelcontextprotocol/tasks"] || capabilities?.extensions?.["modelcontextprotocol.io/tasks"]);
+}
+function sessionSupportsTasks(sessionId) {
+  return !!(sessionId && clientSupportsTasksBySession.get(sessionId));
+}
+function isLongDispatchAgentCall(body) {
+  if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent" || getTaskParams(body)) return false;
+  const timeoutMs = Number(body.params?.arguments?.timeoutMs || 30000);
+  return Number.isFinite(timeoutMs) && timeoutMs > DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS;
+}
+function shouldAutoWrapDispatchAgent(body, sessionId) {
+  if (!isLongDispatchAgentCall(body) || !sessionSupportsTasks(sessionId)) return false;
+  // Threshold is 50000ms (not the original 120000ms) because Claude.ai has a hardcoded ~60s client-side timeout — see anthropics/claude-code#22542. 50s gives 10s margin.
+  return true;
+}
+function callToolResultFromDispatch(result, taskId) {
+  return {
+    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    isError: !result.ok || undefined,
+    _meta: { "io.modelcontextprotocol/related-task": { taskId } }
+  };
+}
+function runEmbeddedAgentForTask(taskRecord, timeoutMs = 60000) {
+  const timeoutSec = Math.max(30, Math.ceil(timeoutMs / 1000));
+  const { agentId, request } = taskRecord;
+  return new Promise((resolve, reject) => {
+    const args = ["agent", "--agent", agentId, "-m", request.task, "--json", "--timeout", String(timeoutSec)];
+    const child = spawn("openclaw", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let settled = false;
+    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(killer); fn(value); };
+    const killer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(reject, new Error(`embedded agent killed after ${timeoutMs + 2000}ms`));
+    }, timeoutMs + 2000);
+    activeTaskChildren.set(taskRecord.taskId, child);
+    markRunning(taskRecord.taskId, child.pid);
+    let stdout = "", stderr = "";
+    child.stdout.on("data", d => stdout += d.toString());
+    child.stderr.on("data", d => stderr += d.toString());
+    child.on("error", err => finish(reject, err));
+    child.on("close", (code, signal) => {
+      if (getTask(taskRecord.taskId)?.status === "cancelled") return finish(resolve, { cancelled: true });
+      if (signal || code !== 0) return finish(reject, new Error(stderr.trim() || `embedded agent exited with ${signal || code}`));
+      const startIdx = stdout.indexOf('{');
+      const endIdx = stdout.lastIndexOf('}');
+      if (startIdx < 0 || endIdx < 0) return finish(reject, new Error(stderr.trim() || "embedded agent failed: no JSON output"));
+      const jsonStr = stdout.substring(startIdx, endIdx + 1);
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const reply = parsed?.payloads?.[0]?.text || parsed?.meta?.finalAssistantVisibleText || null;
+        finish(resolve, { raw: jsonStr, reply });
+      } catch (e) {
+        finish(reject, new Error("embedded agent JSON parse failed: " + e.message));
+      }
+    });
+  });
+}
+function startDispatchTask({ args, authContext, taskParams }) {
+  const agentId = args.agentId || DEFAULT_AGENT_ID;
+  const sessionKey = args.sessionKey || `agent:${agentId}:main`;
+  const taskRecord = createTask({ agentId, sessionKey, request: { ...args, agentId, sessionKey }, authContext, ttl: taskParams?.ttl });
+  runEmbeddedAgentForTask(taskRecord, args.timeoutMs || 30000).then(fb => {
+    if (fb?.cancelled) return;
+    const result = { ok: true, taskId: taskRecord.taskId, sessionKey, reply: fb.reply, raw: fb.raw };
+    markCompleted(taskRecord.taskId, callToolResultFromDispatch(result, taskRecord.taskId));
+  }).catch(error => {
+    const result = callToolResultFromDispatch({ ok: false, taskId: taskRecord.taskId, error: error.message }, taskRecord.taskId);
+    markFailed(taskRecord.taskId, error, result);
+  });
+  return taskRecord;
+}
+function taskCreateResult(task) {
+  return { taskId: task.taskId, status: task.status, task: publicTask(task), _meta: { "io.modelcontextprotocol/model-immediate-response": `Task ${task.taskId} accepted. Poll tasks/get, then tasks/result when complete.` } };
+}
+async function handleTaskRpc(body, authContext, sessionId) {
+  const params = body.params || {};
+  if (isLongDispatchAgentCall(body) && !sessionSupportsTasks(sessionId)) {
+    return { error: { code: -32602, message: LONG_RUNNING_DISPATCH_REQUIRES_TASKS_MESSAGE }, jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (isTaskAugmentedCall(body) || shouldAutoWrapDispatchAgent(body, sessionId)) {
+    const args = params.arguments || {};
+    const taskParams = getTaskParams(body) || { ttl: args.timeoutMs };
+    const task = startDispatchTask({ args, authContext, taskParams });
+    return { result: taskCreateResult(task), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/get") {
+    const task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: publicTask(task), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/list") {
+    return { result: listTasks({ cursor: params.cursor, limit: params.limit, status: params.status, clientId: authContext?.clientId || "anonymous" }), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/cancel") {
+    const task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    if (["completed", "failed", "cancelled"].includes(task.status)) return { error: { code: -32602, message: `Cannot cancel task in terminal status '${task.status}'` }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: publicTask(cancelTask(params.taskId)), jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (body.method === "tasks/result") {
+    const task = getTask(params.taskId);
+    if (!assertTaskAccess(task, authContext)) return { error: { code: -32602, message: "Task not found" }, jsonrpc: "2.0", id: body.id ?? null };
+    if (!["completed", "failed", "cancelled"].includes(task.status)) return { error: { code: -32001, message: `Task is not complete (status: ${task.status})` }, jsonrpc: "2.0", id: body.id ?? null };
+    if (task.status === "cancelled") return { result: { content: [{ type: "text", text: JSON.stringify({ ok: false, taskId: task.taskId, status: "cancelled" }, null, 2) }], isError: true, _meta: { "io.modelcontextprotocol/related-task": { taskId: task.taskId } } }, jsonrpc: "2.0", id: body.id ?? null };
+    return { result: task.result, jsonrpc: "2.0", id: body.id ?? null };
+  }
+  return null;
+}
+loadTasks();
 
 function requireMcpAuth(req, res) { const token = getBearerToken(req); if (!validateAccessToken(token)) { res.writeHead(401, { "Content-Type": "application/json", "WWW-Authenticate": `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`, ...corsHeaders() }); res.end(JSON.stringify({ error: "unauthorized" })); return false; } return true; }
 function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30000, { useCoding = false } = {}) {
@@ -416,20 +641,27 @@ async function callTaskRpcTool(method, params = {}, extra = {}) {
 
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(120000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.server.registerCapabilities({ tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } });
+  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(120000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+    const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
+  });
+  server.tool("tasks_get", "Get metadata for a SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/get", { taskId }, extra));
+  server.tool("tasks_list", "List SEP-1686 tasks visible to this client.", { cursor: z.string().optional() }, async ({ cursor }, extra) => callTaskRpcTool("tasks/list", { cursor }, extra));
+  server.tool("tasks_cancel", "Cancel a running SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/cancel", { taskId }, extra));
+  server.tool("tasks_result", "Return the result for a completed SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/result", { taskId }, extra));
+  server.tool("dispatch_coding", "Dispatch a coding task directly to the coding gateway (port 18820). Use for direct exec/tool calls on the coding runtime, not for agent session messages.", { method: z.string().default("sessions.send"), params: z.string().describe("JSON-encoded params object").default("{}"), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ method, params: paramsStr, timeoutMs }) => {
+    const params = JSON.parse(paramsStr);
+    if (!OPENCLAW_CODING_PORT) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Coding gateway not configured" }, null, 2) }], isError: true };
     const jobId = randomUUID();
-    const key = sessionKey || `agent:${agentId}:main`;
-    const previousReply = getLatestAssistantReply(key);
-    const params = { key, message: task };
-    recordJob({ id: jobId, type: "dispatch_agent", status: "running", request: params });
+    recordJob({ id: jobId, type: "dispatch_coding", status: "running", request: { method, params } });
     try {
-      const raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 10000));
-      const reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
-      const job = recordJob({ id: jobId, type: "dispatch_agent", status: reply || !waitForReply ? "completed" : "started", request: params, raw, reply });
-      return { content: [{ type: "text", text: JSON.stringify({ ok: true, jobId, sessionKey: key, reply, raw: job.raw }, null, 2) }] };
+      const raw = await runGatewayCall(method, params, false, timeoutMs, { useCoding: true });
+      recordJob({ id: jobId, type: "dispatch_coding", status: "completed", request: { method, params }, raw });
+      return { content: [{ type: "text", text: JSON.stringify({ ok: true, jobId, gateway: "coding:18820", raw }, null, 2) }] };
     } catch (error) {
-      recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: error.message });
-      return { content: [{ type: "text", text: JSON.stringify({ ok: false, jobId, error: error.message }, null, 2) }], isError: true };
+      recordJob({ id: jobId, type: "dispatch_coding", status: "failed", request: { method, params }, error: error.message });
+      return { content: [{ type: "text", text: JSON.stringify({ ok: false, jobId, error: error.message, gateway: "coding:18820" }, null, 2) }], isError: true };
     }
   });
   server.tool("check_status", "Check status of a previous MCP job or an OpenClaw session.", { jobId: z.string().optional(), sessionKey: z.string().optional() }, async ({ jobId, sessionKey }) => {
@@ -483,8 +715,10 @@ async function getTransport(req, parsedBody) {
   if (sessionId && transports.has(sessionId)) return transports.get(sessionId);
   if (parsedBody && isInitializeRequest(parsedBody)) {
     const server = buildServer();
+    const authContext = getAuthContext(req);
+    const supportsTasks = clientSupportsTasks(parsedBody.params?.capabilities);
     let transport;
-    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
+    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); authContextsBySession.set(id, authContext); clientSupportsTasksBySession.set(id, supportsTasks); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); authContextsBySession.delete(id); clientSupportsTasksBySession.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
     transport.onerror = err => logLine(`MCP transport error: ${err.message}`);
     await server.connect(transport);
     return transport;
@@ -521,7 +755,7 @@ const app = http.createServer(async (req, res) => {
       if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
       await transport.handleRequest(req, res); return;
     }
-    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
+    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext, sessionId); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
     return jsonResponse(res, 405, { error: "method not allowed" }, { Allow: "GET, POST, DELETE, OPTIONS" });
   } catch (error) {
     logLine(`MCP handler error: ${error.stack || error.message}`);
