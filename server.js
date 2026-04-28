@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
+import { hostname } from "node:os";
 import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -36,6 +37,12 @@ const AGENT_COMPLETIONS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/logs/agen
 const TASKS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/claude-mcp-server/.tasks.json";
 const TASK_TTL_MS = Number(process.env.MCP_TASK_TTL_MS || 24 * 60 * 60 * 1000);
 const TASK_POLL_INTERVAL_MS = Number(process.env.MCP_TASK_POLL_INTERVAL_MS || 2000);
+const OPENCLAW_CONFIG_FILE = "/Users/jarvis/.openclaw/openclaw.json";
+const JARVIS_STATUS_LOGS = {
+  gateway: "/Users/jarvis/.openclaw/logs/gateway.log",
+  mcpServer: "/Users/jarvis/.openclaw/logs/mcp-server.log",
+  sshTunnel: "/Users/jarvis/.openclaw/logs/mcp-tunnel.log"
+};
 
 if (!API_KEY || !OPENCLAW_TOKEN || !OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) process.exit(1);
 
@@ -100,6 +107,139 @@ function getLatestAssistantReply(sessionKey) { const sessionId = getSessionIdFor
 function readJsonFile(file, fallback) { try { if (!existsSync(file)) return fallback; return JSON.parse(readFileSync(file, "utf8")); } catch { return fallback; } }
 function listAgentStatuses() { if (!existsSync(AGENT_STATUS_DIR)) return []; return readdirSync(AGENT_STATUS_DIR).filter(name => name.endsWith('.json')).map(name => readJsonFile(`${AGENT_STATUS_DIR}/${name}`, null)).filter(Boolean); }
 function getCompletions(agent) { const completions = readJsonFile(AGENT_COMPLETIONS_FILE, []); const filtered = agent ? completions.filter(entry => entry?.agent === agent) : completions; return filtered.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()); }
+
+function redactJarvisStatusString(value, extraSecrets = []) {
+  let out = String(value || "");
+  for (const secret of extraSecrets.filter(Boolean)) out = out.split(secret).join("[REDACTED:credential]");
+  return out
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED:anthropic-key]")
+    .replace(/sk-proj-[A-Za-z0-9_-]+/g, "[REDACTED:openai-key]")
+    .replace(/sk-[A-Za-z0-9_-]{40,}/g, "[REDACTED:openai-key]")
+    .replace(/xoxb-[A-Za-z0-9_-]+/g, "[REDACTED:slack-token]")
+    .replace(/xapp-[A-Za-z0-9_-]+/g, "[REDACTED:slack-token]")
+    .replace(/[0-9]{8,12}:[A-Za-z0-9_-]{30,}/g, "[REDACTED:telegram-token]")
+    .replace(/bearer\s+[A-Za-z0-9._-]+/gi, "[REDACTED:bearer]")
+    .replace(/(secret|password|token|api[_-]?key)["':=\s]+["']?[A-Za-z0-9_/+\-=.]{12,}["']?/gi, "[REDACTED:credential]");
+}
+
+function runReadOnlyCommand(command, args, timeoutMs = 2000) {
+  const commandResult = new Promise(resolve => {
+    const child = execFile(command, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+      resolve(error ? null : stdout);
+    });
+    child.on("error", () => resolve(null));
+  });
+  return Promise.race([commandResult, new Promise(resolve => setTimeout(() => resolve(null), timeoutMs))]);
+}
+
+function parseOpenClawConfig() {
+  try {
+    const raw = readFileSync(OPENCLAW_CONFIG_FILE, "utf8");
+    const cleaned = raw.replace(/\/\/[^\n]*/g, "").replace(/,(\s*[}\]])/g, "$1");
+    return JSON.parse(cleaned);
+  } catch { return null; }
+}
+
+function getConfigValue(config, path) {
+  return path.split(".").reduce((obj, key) => obj?.[key], config);
+}
+
+function parseLaunchctlList(raw) {
+  if (!raw) return [];
+  return raw.trim().split(/\r?\n/).slice(1).map(line => {
+    const parts = line.trim().split(/\s+/);
+    const label = parts.slice(2).join(" ");
+    return { pid: parts[0] === "-" ? null : Number(parts[0]), status: Number(parts[1]), label };
+  }).filter(service => /openclaw|jarvis|com\.openclaw/i.test(service.label));
+}
+
+function parseLsof(raw) {
+  if (!raw) return null;
+  const line = raw.trim().split(/\r?\n/)[1];
+  if (!line) return null;
+  const parts = line.trim().split(/\s+/);
+  const pid = Number(parts[1]);
+  return Number.isFinite(pid) ? { pid, command: parts[0] || null, alive: true } : null;
+}
+
+function parsePs(raw, extraSecrets) {
+  if (!raw) return null;
+  const line = raw.trim().split(/\r?\n/)[0];
+  if (!line) return null;
+  const parts = line.trim().split(/\s+/);
+  const pid = Number(parts[0]);
+  if (!Number.isFinite(pid)) return null;
+  const cpu = Number(parts[1]);
+  const mem = Number(parts[2]);
+  const started = parts.slice(3, 8).join(" ");
+  const command = parts.slice(8).join(" ");
+  return { pid, cpu: Number.isFinite(cpu) ? cpu : null, mem: Number.isFinite(mem) ? mem : null, command: redactJarvisStatusString(command, extraSecrets), started };
+}
+
+function agentSessionSummary(agent) {
+  const sessions = readJsonFile(`${OPENCLAW_AGENTS_DIR}/${agent}/sessions/sessions.json`, null);
+  if (!sessions) return null;
+  const preferred = sessions[`agent:${agent}:main`] || Object.values(sessions)[0];
+  if (!preferred) return null;
+  return {
+    sessionId: preferred.sessionId || null,
+    sessionStartedAt: preferred.startedAt ? new Date(preferred.startedAt).toISOString() : (preferred.createdAt || null),
+    lastUpdated: preferred.updatedAt ? new Date(preferred.updatedAt).toISOString() : (preferred.lastUpdated || null)
+  };
+}
+
+async function collectJarvisStatusCore({ include_logs = false, log_lines = 50 } = {}) {
+  const config = parseOpenClawConfig();
+  const gatewayToken = config?.gateway?.authToken || config?.gateway?.token || config?.authToken || config?.token || "";
+  const launchdRaw = await runReadOnlyCommand("launchctl", ["list"]);
+  const services = parseLaunchctlList(launchdRaw);
+  const portEntries = await Promise.all([18789, 18820, 8787, 19876].map(async port => [String(port), parseLsof(await runReadOnlyCommand("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]))]));
+  const ports = Object.fromEntries(portEntries);
+  const trackedPids = Array.from(new Set(Object.values(ports).map(port => port?.pid).filter(Number.isFinite)));
+  const processes = (await Promise.all(trackedPids.map(async pid => parsePs(await runReadOnlyCommand("ps", ["-p", String(pid), "-o", "pid=,pcpu=,pmem=,lstart=,command="]), [gatewayToken])))).filter(Boolean);
+  const hasService = label => services.some(service => service.label.includes(label) && service.status === 0);
+  const health = {
+    mainGatewayUp: !!ports["18789"]?.alive && hasService("ai.openclaw.gateway"),
+    codingGatewayUp: !!ports["18820"]?.alive && hasService("ai.openclaw.coding"),
+    mcpServerUp: !!ports["8787"]?.alive,
+    sshTunnelUp: !!ports["19876"]?.alive && hasService("com.jarvis.mcp-tunnel"),
+    overallOk: false
+  };
+  health.overallOk = health.mainGatewayUp && health.codingGatewayUp && health.mcpServerUp && health.sshTunnelUp;
+  const snapshot = {
+    timestamp: new Date().toISOString(),
+    hostname: hostname(),
+    health,
+    launchd: { services },
+    ports,
+    processes,
+    configs: {
+      "session.reset": getConfigValue(config, "session.reset") ?? null,
+      "session.resetTriggers": getConfigValue(config, "session.resetTriggers") ?? null,
+      "gateway.bind": getConfigValue(config, "gateway.bind") ?? null,
+      "gateway.port": getConfigValue(config, "gateway.port") ?? null
+    },
+    agents: {
+      artoo: agentSessionSummary("artoo"),
+      threepo: agentSessionSummary("threepo")
+    }
+  };
+  if (include_logs) {
+    snapshot.logs = Object.fromEntries(await Promise.all(Object.entries(JARVIS_STATUS_LOGS).map(async ([name, path]) => {
+      const raw = await runReadOnlyCommand("tail", ["-n", String(log_lines), path]);
+      return [name, raw ? raw.split(/\r?\n/).filter(Boolean).map(line => redactJarvisStatusString(line, [gatewayToken])) : null];
+    })));
+  }
+  return snapshot;
+}
+
+async function collectJarvisStatus(options = {}) {
+  const includeLogs = !!options.include_logs;
+  const logLines = Math.min(Math.max(Number(options.log_lines ?? 50), 0), 200);
+  const timeoutMs = includeLogs && logLines === 200 ? 30000 : 10000;
+  const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
+  return Promise.race([collectJarvisStatusCore({ include_logs: includeLogs, log_lines: logLines }), timeoutSnapshot]);
+}
 async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
 function updateAgentStatus(agentId, status, task) {
   try {
@@ -482,6 +622,10 @@ function buildServer() {
   server.tool("list_agents", "List tracked agents with session keys and current status.", {}, async () => {
     const agents = listAgentStatuses();
     return { content: [{ type: "text", text: JSON.stringify({ ok: true, agents }, null, 2) }] };
+  });
+  server.tool("jarvis_status", "Returns a structured snapshot of Jarvis OpenClaw + MCP infrastructure state — launchd services, listening ports, running processes, recent logs (with secrets redacted), agent session metadata, and health roll-ups. Read-only; no mutations.", { include_logs: z.boolean().optional().default(false), log_lines: z.number().int().min(0).max(200).optional().default(50) }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ include_logs, log_lines }, extra) => {
+    const snapshot = await collectJarvisStatus({ include_logs, log_lines });
+    return { content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }], structuredContent: snapshot };
   });
   server.tool("get_completions", "Get recent agent completions, optionally filtered by agent.", { agent: z.string().optional() }, async ({ agent }) => {
     const completions = getCompletions(agent);
