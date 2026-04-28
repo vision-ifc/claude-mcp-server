@@ -103,6 +103,32 @@ function recordJob(job) { const full = { ...job, updatedAt: new Date().toISOStri
 function getSessionIdForKey(sessionKey) { const agentId = sessionKey.split(":")[1]; const p = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`; if (!existsSync(p)) return null; const data = JSON.parse(readFileSync(p, "utf8")); return data?.[sessionKey]?.sessionId || null; }
 function getLatestAssistantReply(sessionKey) { const sessionId = getSessionIdForKey(sessionKey); if (!sessionId) return null; const p = `${OPENCLAW_AGENTS_DIR}/${sessionKey.split(":")[1]}/sessions/${sessionId}.jsonl`; if (!existsSync(p)) return null; const raw = readFileSync(p, "utf8").trim(); if (!raw) return null; const lines = raw.split(/\r?\n/).reverse(); for (const line of lines) { try { const obj = JSON.parse(line); const msg = obj.message; if (msg?.role === "assistant" && Array.isArray(msg.content)) { const parts = msg.content.filter(c => c?.type === "text" && typeof c.text === "string").map(c => c.text.trim()).filter(Boolean); if (parts.length) return parts.join("\n"); } } catch {} } return null; }
 function readJsonFile(file, fallback) { try { if (!existsSync(file)) return fallback; return JSON.parse(readFileSync(file, "utf8")); } catch { return fallback; } }
+function isoOrNull(value) { if (!value) return null; const time = typeof value === "number" ? value : Date.parse(value); return Number.isFinite(time) ? new Date(time).toISOString() : null; }
+function readLatestAssistantText(sessionKey) {
+  const agentId = sessionKey?.split(":")?.[1];
+  if (!agentId) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated: null, reply: null, reason: "no_active_session" };
+  const sessionsPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`;
+  const sessions = readJsonFile(sessionsPath, null);
+  const entry = sessions?.[sessionKey];
+  const sessionId = entry?.sessionId || null;
+  const sessionLastUpdated = isoOrNull(entry?.updatedAt || entry?.lastUpdated || entry?.endedAt || entry?.startedAt);
+  if (!sessionId) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated, reply: null, reason: "no_active_session" };
+  const canonicalTranscriptPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/${sessionId}.jsonl`;
+  const transcriptPath = existsSync(canonicalTranscriptPath) ? canonicalTranscriptPath : entry?.sessionFile;
+  if (!transcriptPath || !existsSync(transcriptPath)) return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_transcript" };
+  const raw = readFileSync(transcriptPath, "utf8");
+  const lines = raw.split(/\r?\n/).filter(line => line.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const obj = JSON.parse(lines[i]);
+      const msg = obj.message;
+      if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+      const parts = msg.content.filter(part => part?.type === "text" && typeof part.text === "string" && part.text.trim()).map(part => part.text.trim());
+      if (parts.length) return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: redactSecrets(parts.join("\n")) };
+    } catch {}
+  }
+  return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_new_reply" };
+}
 function listAgentStatuses() { if (!existsSync(AGENT_STATUS_DIR)) return []; return readdirSync(AGENT_STATUS_DIR).filter(name => name.endsWith('.json')).map(name => readJsonFile(`${AGENT_STATUS_DIR}/${name}`, null)).filter(Boolean); }
 function getCompletions(agent) { const completions = readJsonFile(AGENT_COMPLETIONS_FILE, []); const filtered = agent ? completions.filter(entry => entry?.agent === agent) : completions; return filtered.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()); }
 
@@ -119,6 +145,7 @@ function redactJarvisStatusString(value, extraSecrets = []) {
     .replace(/bearer\s+[A-Za-z0-9._-]+/gi, "[REDACTED:bearer]")
     .replace(/(secret|password|token|api[_-]?key)["':=\s]+["']?[A-Za-z0-9_/+\-=.]{12,}["']?/gi, "[REDACTED:credential]");
 }
+function redactSecrets(value, extraSecrets = []) { return redactJarvisStatusString(value, extraSecrets); }
 
 function runReadOnlyCommand(command, args, timeoutMs = 2000) {
   const commandResult = new Promise(resolve => {
@@ -616,7 +643,6 @@ async function directToolCall(name, args = {}) {
   if (name === "list_agents") return { ok: true, agents: listAgentStatuses() };
   if (name === "get_completions") return { ok: true, completions: getCompletions(args.agent) };
   if (name === "get_agent_output") return readLatestAssistantText(args.sessionKey);
-  if (name === "jarvis_restart_service") return restartServiceImpl(args.service, args.mode || "kickstart");
   if (name === "dispatch_agent") return dispatchAgentDirect(args);
   return { ok: false, error: `unknown tool: ${name}` };
 }
@@ -703,9 +729,9 @@ function buildServer() {
     const completions = getCompletions(agent);
     return { content: [{ type: "text", text: JSON.stringify({ ok: true, completions }, null, 2) }] };
   });
-  server.tool("get_agent_output", "Get the latest assistant reply for an agent session.", { sessionKey: z.string() }, async ({ sessionKey }) => {
-    const reply = getLatestAssistantReply(sessionKey);
-    return { content: [{ type: "text", text: JSON.stringify({ ok: true, sessionKey, reply }, null, 2) }] };
+  server.tool("get_agent_output", "Get the latest assistant reply for an agent session.", { sessionKey: z.string() }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ sessionKey }) => {
+    const result = readLatestAssistantText(sessionKey);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   });
   return server;
 }
