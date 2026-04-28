@@ -48,6 +48,7 @@ const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
 const authContextsBySession = new Map();
+const clientSupportsTasksBySession = new Map();
 const activeSseBySession = new Map();
 const activeTaskChildren = new Map();
 let taskState = { tasks: [] };
@@ -211,11 +212,23 @@ function getTaskParams(body) {
   return body?.params?.task || body?.params?._meta?.["modelcontextprotocol.io/task"] || body?.params?._meta?.["io.modelcontextprotocol/task"] || body?._meta?.["modelcontextprotocol.io/task"] || body?._meta?.["io.modelcontextprotocol/task"] || null;
 }
 const DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS = 50000;
-function shouldAutoWrapDispatchAgent(body) {
+const LONG_RUNNING_DISPATCH_REQUIRES_TASKS_MESSAGE = "Long-running dispatch (timeoutMs > 50000) requires client-side SEP-1686 task support. Your client did not advertise this capability during initialize. Use timeoutMs <= 50000 for synchronous dispatch.";
+const TASK_TOOL_REQUIRES_TASKS_MESSAGE = "This tasks_* tool requires client-side SEP-1686 task support. Your client did not advertise this capability during initialize.";
+function clientSupportsTasks(capabilities = {}) {
+  return !!(capabilities?.tasks || capabilities?.experimental?.tasks || capabilities?.extensions?.["io.modelcontextprotocol/tasks"] || capabilities?.extensions?.["modelcontextprotocol.io/tasks"]);
+}
+function sessionSupportsTasks(sessionId) {
+  return !!(sessionId && clientSupportsTasksBySession.get(sessionId));
+}
+function isLongDispatchAgentCall(body) {
   if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent" || getTaskParams(body)) return false;
   const timeoutMs = Number(body.params?.arguments?.timeoutMs || 30000);
-  // Threshold is 50000ms (not the original 120000ms) because Claude.ai has a hardcoded ~60s client-side timeout — see anthropics/claude-code#22542. 50s gives 10s margin.
   return Number.isFinite(timeoutMs) && timeoutMs > DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS;
+}
+function shouldAutoWrapDispatchAgent(body, sessionId) {
+  if (!isLongDispatchAgentCall(body) || !sessionSupportsTasks(sessionId)) return false;
+  // Threshold is 50000ms (not the original 120000ms) because Claude.ai has a hardcoded ~60s client-side timeout — see anthropics/claude-code#22542. 50s gives 10s margin.
+  return true;
 }
 function callToolResultFromDispatch(result, taskId) {
   return {
@@ -276,9 +289,12 @@ function startDispatchTask({ args, authContext, taskParams }) {
 function taskCreateResult(task) {
   return { taskId: task.taskId, status: task.status, task: publicTask(task), _meta: { "io.modelcontextprotocol/model-immediate-response": `Task ${task.taskId} accepted. Poll tasks/get, then tasks/result when complete.` } };
 }
-async function handleTaskRpc(body, authContext) {
+async function handleTaskRpc(body, authContext, sessionId) {
   const params = body.params || {};
-  if (isTaskAugmentedCall(body) || shouldAutoWrapDispatchAgent(body)) {
+  if (isLongDispatchAgentCall(body) && !sessionSupportsTasks(sessionId)) {
+    return { error: { code: -32602, message: LONG_RUNNING_DISPATCH_REQUIRES_TASKS_MESSAGE }, jsonrpc: "2.0", id: body.id ?? null };
+  }
+  if (isTaskAugmentedCall(body) || shouldAutoWrapDispatchAgent(body, sessionId)) {
     const args = params.arguments || {};
     const taskParams = getTaskParams(body) || { ttl: args.timeoutMs };
     const task = startDispatchTask({ args, authContext, taskParams });
@@ -409,7 +425,8 @@ function getAuthContextFromToolExtra(extra = {}) {
 }
 
 async function callTaskRpcTool(method, params = {}, extra = {}) {
-  const response = await handleTaskRpc({ jsonrpc: "2.0", id: "tool", method, params }, getAuthContextFromToolExtra(extra));
+  if (!sessionSupportsTasks(extra.sessionId)) return { content: [{ type: "text", text: TASK_TOOL_REQUIRES_TASKS_MESSAGE }], isError: true };
+  const response = await handleTaskRpc({ jsonrpc: "2.0", id: "tool", method, params }, getAuthContextFromToolExtra(extra), extra.sessionId);
   if (response?.error) return { content: [{ type: "text", text: JSON.stringify(response.error, null, 2) }], isError: true };
   return taskToolResult(response.result);
 }
@@ -483,8 +500,9 @@ async function getTransport(req, parsedBody) {
   if (parsedBody && isInitializeRequest(parsedBody)) {
     const server = buildServer();
     const authContext = getAuthContext(req);
+    const supportsTasks = clientSupportsTasks(parsedBody.params?.capabilities);
     let transport;
-    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); authContextsBySession.set(id, authContext); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); authContextsBySession.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
+    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); authContextsBySession.set(id, authContext); clientSupportsTasksBySession.set(id, supportsTasks); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); authContextsBySession.delete(id); clientSupportsTasksBySession.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
     transport.onerror = err => logLine(`MCP transport error: ${err.message}`);
     await server.connect(transport);
     return transport;
@@ -521,7 +539,7 @@ const app = http.createServer(async (req, res) => {
       if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
       await transport.handleRequest(req, res); return;
     }
-    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
+    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext, sessionId); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
     return jsonResponse(res, 405, { error: "method not allowed" }, { Allow: "GET, POST, DELETE, OPTIONS" });
   } catch (error) {
     logLine(`MCP handler error: ${error.stack || error.message}`);
