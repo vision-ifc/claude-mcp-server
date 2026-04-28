@@ -1,8 +1,8 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
-import { hostname, homedir, userInfo } from "node:os";
+import { hostname } from "node:os";
 import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
-import { spawn, execFile, execFileSync } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -31,6 +31,28 @@ const AGENT_COMPLETIONS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/logs/agen
 const TASKS_FILE = "/Users/jarvis/.openclaw/workspace-yoda/claude-mcp-server/.tasks.json";
 const TASK_TTL_MS = Number(process.env.MCP_TASK_TTL_MS || 24 * 60 * 60 * 1000);
 const TASK_POLL_INTERVAL_MS = Number(process.env.MCP_TASK_POLL_INTERVAL_MS || 2000);
+
+function tailReadFile(filePath, maxBytes = 262144) {
+  const fd = openSync(filePath, "r");
+  try {
+    const stat = fstatSync(fd);
+    if (stat.size <= maxBytes) {
+      const full = Buffer.alloc(stat.size);
+      readSync(fd, full, 0, stat.size, 0);
+      return full.toString("utf8");
+    }
+    const buf = Buffer.alloc(maxBytes);
+    readSync(fd, buf, 0, maxBytes, stat.size - maxBytes);
+    let text = buf.toString("utf8");
+    const firstNewline = text.indexOf("\n");
+    if (firstNewline > 0 && firstNewline < text.length - 1) {
+      text = text.slice(firstNewline + 1);
+    }
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
 const OPENCLAW_CONFIG_FILE = "/Users/jarvis/.openclaw/openclaw.json";
 const JARVIS_STATUS_LOGS = {
   gateway: "/Users/jarvis/.openclaw/logs/gateway.log",
@@ -116,7 +138,7 @@ function readLatestAssistantText(sessionKey) {
   const canonicalTranscriptPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/${sessionId}.jsonl`;
   const transcriptPath = existsSync(canonicalTranscriptPath) ? canonicalTranscriptPath : entry?.sessionFile;
   if (!transcriptPath || !existsSync(transcriptPath)) return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_transcript" };
-  const raw = readFileSync(transcriptPath, "utf8");
+  const raw = tailReadFile(transcriptPath, 262144);
   const lines = raw.split(/\r?\n/).filter(line => line.trim());
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
