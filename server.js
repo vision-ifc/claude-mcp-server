@@ -47,6 +47,7 @@ const refreshTokens = new Map();
 const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
+const authContextsBySession = new Map();
 const activeSseBySession = new Map();
 const activeTaskChildren = new Map();
 let taskState = { tasks: [] };
@@ -204,7 +205,17 @@ function cancelTask(taskId) {
 }
 function isTaskAugmentedCall(body) {
   if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent") return false;
-  return !!(body.params.task || body.params?._meta?.["modelcontextprotocol.io/task"] || body.params?._meta?.["io.modelcontextprotocol/task"] || body._meta?.["modelcontextprotocol.io/task"]);
+  return !!getTaskParams(body);
+}
+function getTaskParams(body) {
+  return body?.params?.task || body?.params?._meta?.["modelcontextprotocol.io/task"] || body?.params?._meta?.["io.modelcontextprotocol/task"] || body?._meta?.["modelcontextprotocol.io/task"] || body?._meta?.["io.modelcontextprotocol/task"] || null;
+}
+const DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS = 50000;
+function shouldAutoWrapDispatchAgent(body) {
+  if (body?.method !== "tools/call" || body?.params?.name !== "dispatch_agent" || getTaskParams(body)) return false;
+  const timeoutMs = Number(body.params?.arguments?.timeoutMs || 30000);
+  // Threshold is 50000ms (not the original 120000ms) because Claude.ai has a hardcoded ~60s client-side timeout — see anthropics/claude-code#22542. 50s gives 10s margin.
+  return Number.isFinite(timeoutMs) && timeoutMs > DISPATCH_AGENT_TASK_WRAP_THRESHOLD_MS;
 }
 function callToolResultFromDispatch(result, taskId) {
   return {
@@ -263,12 +274,14 @@ function startDispatchTask({ args, authContext, taskParams }) {
   return taskRecord;
 }
 function taskCreateResult(task) {
-  return { task: publicTask(task), _meta: { "io.modelcontextprotocol/model-immediate-response": `Task ${task.taskId} accepted. Poll tasks/get, then tasks/result when complete.` } };
+  return { taskId: task.taskId, status: task.status, task: publicTask(task), _meta: { "io.modelcontextprotocol/model-immediate-response": `Task ${task.taskId} accepted. Poll tasks/get, then tasks/result when complete.` } };
 }
 async function handleTaskRpc(body, authContext) {
   const params = body.params || {};
-  if (isTaskAugmentedCall(body)) {
-    const task = startDispatchTask({ args: params.arguments || {}, authContext, taskParams: params.task || params._meta?.["modelcontextprotocol.io/task"] || body._meta?.["modelcontextprotocol.io/task"] || {} });
+  if (isTaskAugmentedCall(body) || shouldAutoWrapDispatchAgent(body)) {
+    const args = params.arguments || {};
+    const taskParams = getTaskParams(body) || { ttl: args.timeoutMs };
+    const task = startDispatchTask({ args, authContext, taskParams });
     return { result: taskCreateResult(task), jsonrpc: "2.0", id: body.id ?? null };
   }
   if (body.method === "tasks/get") {
@@ -384,13 +397,34 @@ async function directToolCall(name, args = {}) {
   return { ok: false, error: `unknown tool: ${name}` };
 }
 
+function taskToolResult(result) {
+  if (result?.content) return result;
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+}
+
+function getAuthContextFromToolExtra(extra = {}) {
+  if (extra.sessionId && authContextsBySession.has(extra.sessionId)) return authContextsBySession.get(extra.sessionId);
+  const token = extra.requestInfo?.headers?.authorization?.startsWith("Bearer ") ? extra.requestInfo.headers.authorization.slice(7) : extra.requestInfo?.headers?.["x-api-key"] || "";
+  return getAuthContextForToken(token) || { type: "mcp-tool", clientId: "anonymous" };
+}
+
+async function callTaskRpcTool(method, params = {}, extra = {}) {
+  const response = await handleTaskRpc({ jsonrpc: "2.0", id: "tool", method, params }, getAuthContextFromToolExtra(extra));
+  if (response?.error) return { content: [{ type: "text", text: JSON.stringify(response.error, null, 2) }], isError: true };
+  return taskToolResult(response.result);
+}
+
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
   server.server.registerCapabilities({ tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(1800000).default(30000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
     const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
   });
+  server.tool("tasks_get", "Get metadata for a SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/get", { taskId }, extra));
+  server.tool("tasks_list", "List SEP-1686 tasks visible to this client.", { cursor: z.string().optional() }, async ({ cursor }, extra) => callTaskRpcTool("tasks/list", { cursor }, extra));
+  server.tool("tasks_cancel", "Cancel a running SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/cancel", { taskId }, extra));
+  server.tool("tasks_result", "Return the result for a completed SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/result", { taskId }, extra));
   server.tool("dispatch_coding", "Dispatch a coding task directly to the coding gateway (port 18820). Use for direct exec/tool calls on the coding runtime, not for agent session messages.", { method: z.string().default("sessions.send"), params: z.string().describe("JSON-encoded params object").default("{}"), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ method, params: paramsStr, timeoutMs }) => {
     const params = JSON.parse(paramsStr);
     if (!OPENCLAW_CODING_PORT) return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "Coding gateway not configured" }, null, 2) }], isError: true };
@@ -448,8 +482,9 @@ async function getTransport(req, parsedBody) {
   if (sessionId && transports.has(sessionId)) return transports.get(sessionId);
   if (parsedBody && isInitializeRequest(parsedBody)) {
     const server = buildServer();
+    const authContext = getAuthContext(req);
     let transport;
-    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
+    transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID(), enableJsonResponse: true, onsessioninitialized: id => { transports.set(id, transport); servers.set(id, server); authContextsBySession.set(id, authContext); logLine(`MCP session initialized: ${id}`); }, onsessionclosed: id => { transports.delete(id); servers.delete(id); authContextsBySession.delete(id); activeSseBySession.delete(id); logLine(`MCP session closed: ${id}`); } });
     transport.onerror = err => logLine(`MCP transport error: ${err.message}`);
     await server.connect(transport);
     return transport;
