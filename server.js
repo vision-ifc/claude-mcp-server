@@ -235,6 +235,15 @@ function parseLsof(raw) {
   return Number.isFinite(pid) ? { pid, command: parts[0] || null, alive: true } : null;
 }
 
+function parsePgrep(raw) {
+  if (!raw) return null;
+  const line = raw.trim().split(/\r?\n/)[0];
+  if (!line) return null;
+  const parts = line.trim().split(/\s+/);
+  const pid = Number(parts[0]);
+  return Number.isFinite(pid) ? { pid, command: parts.slice(1).join(" ") || null, alive: true } : null;
+}
+
 function parsePs(raw, extraSecrets) {
   if (!raw) return null;
   const line = raw.trim().split(/\r?\n/)[0];
@@ -266,16 +275,17 @@ async function collectJarvisStatusCore({ include_logs = false, log_lines = 50 } 
   const gatewayToken = config?.gateway?.authToken || config?.gateway?.token || config?.authToken || config?.token || "";
   const launchdRaw = await runReadOnlyCommand("launchctl", ["list"]);
   const services = parseLaunchctlList(launchdRaw);
-  const portEntries = await Promise.all([18789, 18820, 8787, 19876].map(async port => [String(port), parseLsof(await runReadOnlyCommand("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]))]));
+  const portEntries = await Promise.all([18789, 18820, 8787].map(async port => [String(port), parseLsof(await runReadOnlyCommand("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"]))]));
   const ports = Object.fromEntries(portEntries);
-  const trackedPids = Array.from(new Set(Object.values(ports).map(port => port?.pid).filter(Number.isFinite)));
+  const sshTunnelProcess = parsePgrep(await runReadOnlyCommand("pgrep", ["-fl", "autossh.*-R[[:space:]]19876:127\\.0\\.0\\.1:8787"]));
+  const trackedPids = Array.from(new Set([...Object.values(ports).map(port => port?.pid), sshTunnelProcess?.pid].filter(Number.isFinite)));
   const processes = (await Promise.all(trackedPids.map(async pid => parsePs(await runReadOnlyCommand("ps", ["-p", String(pid), "-o", "pid=,pcpu=,pmem=,lstart=,command="]), [gatewayToken])))).filter(Boolean);
   const hasService = label => services.some(service => service.label.includes(label) && service.status === 0);
   const health = {
     mainGatewayUp: !!ports["18789"]?.alive && hasService("ai.openclaw.gateway"),
     codingGatewayUp: !!ports["18820"]?.alive && hasService("ai.openclaw.coding"),
     mcpServerUp: !!ports["8787"]?.alive,
-    sshTunnelUp: !!ports["19876"]?.alive && hasService("com.jarvis.mcp-tunnel"),
+    sshTunnelUp: !!sshTunnelProcess?.alive && hasService("com.jarvis.mcp-tunnel"),
     overallOk: false
   };
   health.overallOk = health.mainGatewayUp && health.codingGatewayUp && health.mcpServerUp && health.sshTunnelUp;
@@ -285,6 +295,7 @@ async function collectJarvisStatusCore({ include_logs = false, log_lines = 50 } 
     health,
     launchd: { services },
     ports,
+    tunnel: { remotePort: 19876, target: "127.0.0.1:8787", process: sshTunnelProcess },
     processes,
     configs: {
       "session.reset": getConfigValue(config, "session.reset") ?? null,
@@ -310,7 +321,7 @@ async function collectJarvisStatus(options = {}) {
   const includeLogs = !!options.include_logs;
   const logLines = Math.min(Math.max(Number(options.log_lines ?? 50), 0), 200);
   const timeoutMs = includeLogs && logLines === 200 ? 30000 : 10000;
-  const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
+  const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null }, tunnel: { remotePort: 19876, target: "127.0.0.1:8787", process: null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
   return Promise.race([collectJarvisStatusCore({ include_logs: includeLogs, log_lines: logLines }), timeoutSnapshot]);
 }
 
