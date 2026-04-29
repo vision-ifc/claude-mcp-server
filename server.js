@@ -16,6 +16,7 @@ const API_KEY = process.env.MCP_API_KEY || "";
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 3600);
+const CLIENT_EVICTION_THRESHOLD_SECONDS = Number(process.env.CLIENT_EVICTION_THRESHOLD_SECONDS || 30 * 24 * 3600);
 const OPENCLAW_BASE_URL = (process.env.OPENCLAW_BASE_URL || "ws://127.0.0.1:18789").replace(/\/$/, "");
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || "";
 const OPENCLAW_CODING_BASE_URL = (process.env.OPENCLAW_CODING_BASE_URL || "").replace(/\/$/, "");
@@ -101,6 +102,8 @@ function parseBody(req) { return new Promise((resolve, reject) => { let data = "
 function parseForm(bodyText) { return Object.fromEntries(new URLSearchParams(bodyText)); }
 function sha256Base64Url(input) { return createHash("sha256").update(input).digest("base64url"); }
 function randomToken(size = 32) { return randomBytes(size).toString("base64url"); }
+function tokenPrefix(token) { return String(token || "").slice(0, 8); }
+function unixToIso(seconds) { return Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null; }
 function isValidRedirectUri(uri) { try { const parsed = new URL(uri); return parsed.protocol === "https:" || parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1"; } catch { return false; } }
 function getBearerToken(req) { const auth = req.headers.authorization || ""; if (auth.startsWith("Bearer ")) return auth.slice(7); return req.headers["x-api-key"] || ""; }
 
@@ -132,7 +135,11 @@ function loadOauthState() {
   if (!existsSync(OAUTH_STATE_FILE)) return;
   try {
     const state = JSON.parse(readFileSync(OAUTH_STATE_FILE, "utf8"));
-    for (const [k, v] of state.registeredClients || []) registeredClients.set(k, v);
+    const evictionCutoff = nowSeconds() - CLIENT_EVICTION_THRESHOLD_SECONDS;
+    for (const [k, v] of state.registeredClients || []) {
+      const lastUsedAt = v?.lastUsedAt ?? v?.client_id_issued_at ?? nowSeconds();
+      if (lastUsedAt >= evictionCutoff) registeredClients.set(k, { ...v, lastUsedAt });
+    }
     for (const [k, v] of state.accessTokens || []) if (v?.expiresAt > nowSeconds()) accessTokens.set(k, { ...v, refreshTokenId: v?.refreshTokenId ?? null });
     for (const [k, v] of state.refreshTokens || []) if (v?.expiresAt > nowSeconds()) refreshTokens.set(k, v);
   } catch (e) {
@@ -140,27 +147,44 @@ function loadOauthState() {
   }
 }
 
-registeredClients.set(OAUTH_CLIENT_ID, { client_id: OAUTH_CLIENT_ID, client_secret: OAUTH_CLIENT_SECRET, redirect_uris: [], token_endpoint_auth_method: "client_secret_post", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], client_name: "Jarvis Claude Connector" });
+registeredClients.set(OAUTH_CLIENT_ID, { client_id: OAUTH_CLIENT_ID, client_secret: OAUTH_CLIENT_SECRET, redirect_uris: [], token_endpoint_auth_method: "client_secret_post", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], client_name: "Jarvis Claude Connector", lastUsedAt: nowSeconds() });
 loadOauthState();
 
-function getAuthContextForToken(token) { if (!token) return null; if (token === API_KEY) return { type: "api-key", clientId: "static-api-key" }; const stored = accessTokens.get(token); if (!stored) return null; if (stored.expiresAt <= nowSeconds()) { accessTokens.delete(token); saveOauthState(); return null; } return { type: "oauth", clientId: stored.clientId || "unknown-oauth-client" }; }
+function getAuthContextForToken(token) { if (!token) return null; if (token === API_KEY) return { type: "api-key", clientId: "static-api-key" }; const stored = accessTokens.get(token); if (!stored) return null; if (stored.expiresAt <= nowSeconds()) { accessTokens.delete(token); /* Defer persistence: expired-token replays must not amplify into synchronous disk writes. */ return null; } return { type: "oauth", clientId: stored.clientId || "unknown-oauth-client" }; }
 function getAuthContext(req) { return getAuthContextForToken(getBearerToken(req)); }
 function validateAccessToken(token) { return !!getAuthContextForToken(token); }
-function issueAccessToken(clientId) { const accessToken = randomToken(32); const refreshToken = randomToken(32); const expiresAt = nowSeconds() + OAUTH_ACCESS_TOKEN_TTL_SECONDS; accessTokens.set(accessToken, { accessToken, clientId, expiresAt, refreshTokenId: refreshToken }); refreshTokens.set(refreshToken, { clientId, expiresAt: nowSeconds() + 30 * 24 * 3600 }); saveOauthState(); return { access_token: accessToken, token_type: "Bearer", expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: "mcp" }; }
+function issueAccessToken(clientId) { const accessToken = randomToken(32); const refreshToken = randomToken(32); const expiresAt = nowSeconds() + OAUTH_ACCESS_TOKEN_TTL_SECONDS; const client = registeredClients.get(clientId); if (client) { client.lastUsedAt = nowSeconds(); registeredClients.set(clientId, client); } accessTokens.set(accessToken, { accessToken, clientId, expiresAt, refreshTokenId: refreshToken }); refreshTokens.set(refreshToken, { clientId, expiresAt: nowSeconds() + 30 * 24 * 3600 }); saveOauthState(); return { access_token: accessToken, token_type: "Bearer", expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: "mcp" }; }
 async function refreshAccessToken(clientId, refreshToken) {
   const existingRefresh = refreshInFlight.get(refreshToken);
   if (existingRefresh) return existingRefresh;
   const refreshPromise = (async () => {
     await new Promise(resolve => setImmediate(resolve));
     const refresh = refreshTokens.get(refreshToken);
-    if (!refresh || refresh.clientId !== clientId || refresh.expiresAt <= nowSeconds()) {
+    let invalidReason = null;
+    if (!refresh) invalidReason = "unknown token";
+    else if (refresh.clientId !== clientId) invalidReason = "client mismatch";
+    else if (refresh.expiresAt <= nowSeconds()) invalidReason = "expired";
+    if (invalidReason) {
+      logLine(`WARN refresh invalid_grant client=${clientId} reason=${invalidReason} refresh=${tokenPrefix(refreshToken)}`);
       throw new Error("invalid_grant");
     }
+    const oldAccessTokenPrefixes = [];
     for (const [accessToken, stored] of accessTokens.entries()) {
-      if (stored?.refreshTokenId === refreshToken) accessTokens.delete(accessToken);
+      if (stored?.refreshTokenId === refreshToken) {
+        oldAccessTokenPrefixes.push(tokenPrefix(accessToken));
+        accessTokens.delete(accessToken);
+      }
     }
     refreshTokens.delete(refreshToken);
-    return issueAccessToken(clientId);
+    const client = registeredClients.get(clientId);
+    if (client) {
+      client.lastUsedAt = nowSeconds();
+      client.lastRefreshAt = nowSeconds();
+      registeredClients.set(clientId, client);
+    }
+    const tokenPair = issueAccessToken(clientId);
+    logLine(`INFO refresh ok client=${clientId} oldAccess=${oldAccessTokenPrefixes.join(",") || "none"} newAccess=${tokenPrefix(tokenPair.access_token)}`);
+    return tokenPair;
   })();
   refreshInFlight.set(refreshToken, refreshPromise);
   try {
@@ -317,6 +341,10 @@ async function collectJarvisStatusCore({ include_logs = false, log_lines = 50 } 
     overallOk: false
   };
   health.overallOk = health.mainGatewayUp && health.codingGatewayUp && health.mcpServerUp && health.sshTunnelUp;
+  const oauth = {
+    clientCount: registeredClients.size,
+    lastRefreshAtByClient: Object.fromEntries(Array.from(registeredClients.entries()).map(([clientId, client]) => [clientId, unixToIso(client?.lastRefreshAt)]).filter(([, lastRefreshAt]) => !!lastRefreshAt))
+  };
   const snapshot = {
     timestamp: new Date().toISOString(),
     hostname: hostname(),
@@ -330,6 +358,7 @@ async function collectJarvisStatusCore({ include_logs = false, log_lines = 50 } 
       "gateway.bind": getConfigValue(config, "gateway.bind") ?? null,
       "gateway.port": getConfigValue(config, "gateway.port") ?? null
     },
+    oauth,
     agents: {
       artoo: agentSessionSummary("artoo"),
       threepo: agentSessionSummary("threepo")
@@ -348,7 +377,7 @@ async function collectJarvisStatus(options = {}) {
   const includeLogs = !!options.include_logs;
   const logLines = Math.min(Math.max(Number(options.log_lines ?? 50), 0), 200);
   const timeoutMs = includeLogs && logLines === 200 ? 30000 : 10000;
-  const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
+  const timeoutSnapshot = new Promise(resolve => setTimeout(() => resolve({ timestamp: new Date().toISOString(), hostname: hostname(), health: { mainGatewayUp: false, codingGatewayUp: false, mcpServerUp: false, sshTunnelUp: false, overallOk: false }, launchd: { services: [] }, ports: { "18789": null, "18820": null, "8787": null, "19876": null }, processes: [], configs: { "session.reset": null, "session.resetTriggers": null, "gateway.bind": null, "gateway.port": null }, oauth: { clientCount: registeredClients.size, lastRefreshAtByClient: {} }, agents: { artoo: null, threepo: null }, error: "jarvis_status collection timed out" }), timeoutMs));
   return Promise.race([collectJarvisStatusCore({ include_logs: includeLogs, log_lines: logLines }), timeoutSnapshot]);
 }
 
@@ -831,7 +860,7 @@ const app = http.createServer(async (req, res) => {
   if (url.pathname === "/healthz") return jsonResponse(res, 200, { ok: true, service: "jarvis-openclaw-mcp", openclawPort: OPENCLAW_PORT, codingPort: OPENCLAW_CODING_PORT || null, codingAgents: Array.from(CODING_GATEWAY_AGENTS), oauth: true });
   if (url.pathname === "/.well-known/oauth-protected-resource") return jsonResponse(res, 200, { resource: PUBLIC_BASE_URL, authorization_servers: [PUBLIC_BASE_URL], bearer_methods_supported: ["header"], scopes_supported: ["mcp"] });
   if (url.pathname === "/.well-known/oauth-authorization-server") return jsonResponse(res, 200, { issuer: PUBLIC_BASE_URL, authorization_endpoint: `${PUBLIC_BASE_URL}/authorize`, token_endpoint: `${PUBLIC_BASE_URL}/token`, registration_endpoint: `${PUBLIC_BASE_URL}/register`, response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic", "none"], code_challenge_methods_supported: ["S256"], scopes_supported: ["mcp"] });
-  if (url.pathname === "/register" && req.method === "POST") { const body = JSON.parse((await parseBody(req)) || "{}"); const clientId = `mcp-${randomToken(12)}`; const clientSecret = randomToken(24); const record = { client_id: clientId, client_secret: clientSecret, client_id_issued_at: nowSeconds(), client_secret_expires_at: 0, redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(isValidRedirectUri) : [], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: body.token_endpoint_auth_method || "client_secret_post", client_name: body.client_name || "Dynamic MCP Client" }; registeredClients.set(clientId, record); saveOauthState(); return jsonResponse(res, 201, record); }
+  if (url.pathname === "/register" && req.method === "POST") { const body = JSON.parse((await parseBody(req)) || "{}"); const clientId = `mcp-${randomToken(12)}`; const clientSecret = randomToken(24); const record = { client_id: clientId, client_secret: clientSecret, client_id_issued_at: nowSeconds(), client_secret_expires_at: 0, lastUsedAt: nowSeconds(), redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(isValidRedirectUri) : [], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: body.token_endpoint_auth_method || "client_secret_post", client_name: body.client_name || "Dynamic MCP Client" }; registeredClients.set(clientId, record); saveOauthState(); return jsonResponse(res, 201, record); }
   if (url.pathname === "/authorize" && req.method === "GET") { const clientId = url.searchParams.get("client_id") || ""; const redirectUri = url.searchParams.get("redirect_uri") || ""; const state = url.searchParams.get("state") || ""; const codeChallenge = url.searchParams.get("code_challenge") || ""; const codeChallengeMethod = url.searchParams.get("code_challenge_method") || ""; const responseType = url.searchParams.get("response_type") || ""; const client = registeredClients.get(clientId); if (!client || responseType !== "code" || !redirectUri || !isValidRedirectUri(redirectUri) || !codeChallenge || codeChallengeMethod !== "S256") return htmlResponse(res, 400, "<h1>Invalid OAuth request</h1>"); const TRUSTED_REDIRECT_ORIGINS = ["https://claude.ai"]; if (TRUSTED_REDIRECT_ORIGINS.some(o => redirectUri.startsWith(o))) { const code = randomToken(24); authCodes.set(code, { clientId, redirectUri, codeChallenge, expiresAt: nowSeconds() + 600 }); const redirect = new URL(redirectUri); redirect.searchParams.set("code", code); if (state) redirect.searchParams.set("state", state); res.writeHead(302, { Location: redirect.toString(), ...corsHeaders() }); return res.end(); } const form = `<!doctype html><html><body style="font-family:sans-serif;max-width:520px;margin:40px auto"><h1>Authorize Claude Connector</h1><p>Enter the MCP API key to approve access for <b>${client.client_name || clientId}</b>.</p><form method="POST" action="/authorize"><input type="hidden" name="client_id" value="${clientId}" /><input type="hidden" name="redirect_uri" value="${redirectUri}" /><input type="hidden" name="state" value="${state}" /><input type="hidden" name="code_challenge" value="${codeChallenge}" /><input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}" /><label>API key<br/><input type="password" name="api_key" style="width:100%;padding:8px" autofocus /></label><br/><br/><button type="submit">Approve</button></form></body></html>`; return htmlResponse(res, 200, form); }
   if (url.pathname === "/authorize" && req.method === "POST") { const form = parseForm(await parseBody(req)); logLine(`POST /authorize — client_id=${form.client_id}, redirect_uri=${form.redirect_uri}, api_key_provided=${!!form.api_key}, api_key_match=${form.api_key === API_KEY}`); const client = registeredClients.get(form.client_id || ""); if (!client || form.api_key !== API_KEY || !isValidRedirectUri(form.redirect_uri || "") || form.code_challenge_method !== "S256") return htmlResponse(res, 401, "<h1>Authorization failed</h1><p>Invalid API key or request.</p>"); const code = randomToken(24); authCodes.set(code, { clientId: form.client_id, redirectUri: form.redirect_uri, codeChallenge: form.code_challenge, expiresAt: nowSeconds() + 600 }); const redirect = new URL(form.redirect_uri); redirect.searchParams.set("code", code); if (form.state) redirect.searchParams.set("state", form.state); res.writeHead(302, { Location: redirect.toString(), ...corsHeaders() }); return res.end(); }
   if (url.pathname === "/token" && req.method === "POST") {
