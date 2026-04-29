@@ -15,7 +15,7 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`
 const API_KEY = process.env.MCP_API_KEY || "";
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
-const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 2592000);
+const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 3600);
 const OPENCLAW_BASE_URL = (process.env.OPENCLAW_BASE_URL || "ws://127.0.0.1:18789").replace(/\/$/, "");
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || "";
 const OPENCLAW_CODING_BASE_URL = (process.env.OPENCLAW_CODING_BASE_URL || "").replace(/\/$/, "");
@@ -81,6 +81,7 @@ const jobs = new Map();
 const authCodes = new Map();
 const accessTokens = new Map();
 const refreshTokens = new Map();
+const refreshInFlight = new Map();
 const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
@@ -132,7 +133,7 @@ function loadOauthState() {
   try {
     const state = JSON.parse(readFileSync(OAUTH_STATE_FILE, "utf8"));
     for (const [k, v] of state.registeredClients || []) registeredClients.set(k, v);
-    for (const [k, v] of state.accessTokens || []) if (v?.expiresAt > nowSeconds()) accessTokens.set(k, v);
+    for (const [k, v] of state.accessTokens || []) if (v?.expiresAt > nowSeconds()) accessTokens.set(k, { ...v, refreshTokenId: v?.refreshTokenId ?? null });
     for (const [k, v] of state.refreshTokens || []) if (v?.expiresAt > nowSeconds()) refreshTokens.set(k, v);
   } catch (e) {
     logLine(`OAuth state load error: ${e.message}`);
@@ -145,7 +146,29 @@ loadOauthState();
 function getAuthContextForToken(token) { if (!token) return null; if (token === API_KEY) return { type: "api-key", clientId: "static-api-key" }; const stored = accessTokens.get(token); if (!stored) return null; if (stored.expiresAt <= nowSeconds()) { accessTokens.delete(token); saveOauthState(); return null; } return { type: "oauth", clientId: stored.clientId || "unknown-oauth-client" }; }
 function getAuthContext(req) { return getAuthContextForToken(getBearerToken(req)); }
 function validateAccessToken(token) { return !!getAuthContextForToken(token); }
-function issueAccessToken(clientId) { const accessToken = randomToken(32); const refreshToken = randomToken(32); const expiresAt = nowSeconds() + OAUTH_ACCESS_TOKEN_TTL_SECONDS; accessTokens.set(accessToken, { accessToken, clientId, expiresAt }); refreshTokens.set(refreshToken, { clientId, expiresAt: nowSeconds() + 30 * 24 * 3600 }); saveOauthState(); return { access_token: accessToken, token_type: "Bearer", expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: "mcp" }; }
+function issueAccessToken(clientId) { const accessToken = randomToken(32); const refreshToken = randomToken(32); const expiresAt = nowSeconds() + OAUTH_ACCESS_TOKEN_TTL_SECONDS; accessTokens.set(accessToken, { accessToken, clientId, expiresAt, refreshTokenId: refreshToken }); refreshTokens.set(refreshToken, { clientId, expiresAt: nowSeconds() + 30 * 24 * 3600 }); saveOauthState(); return { access_token: accessToken, token_type: "Bearer", expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, refresh_token: refreshToken, scope: "mcp" }; }
+async function refreshAccessToken(clientId, refreshToken) {
+  const existingRefresh = refreshInFlight.get(refreshToken);
+  if (existingRefresh) return existingRefresh;
+  const refreshPromise = (async () => {
+    await new Promise(resolve => setImmediate(resolve));
+    const refresh = refreshTokens.get(refreshToken);
+    if (!refresh || refresh.clientId !== clientId || refresh.expiresAt <= nowSeconds()) {
+      throw new Error("invalid_grant");
+    }
+    for (const [accessToken, stored] of accessTokens.entries()) {
+      if (stored?.refreshTokenId === refreshToken) accessTokens.delete(accessToken);
+    }
+    refreshTokens.delete(refreshToken);
+    return issueAccessToken(clientId);
+  })();
+  refreshInFlight.set(refreshToken, refreshPromise);
+  try {
+    return await refreshPromise;
+  } finally {
+    refreshInFlight.delete(refreshToken);
+  }
+}
 function recordJob(job) { const full = { ...job, updatedAt: new Date().toISOString() }; jobs.set(job.id, full); return full; }
 function getSessionIdForKey(sessionKey) { const agentId = sessionKey.split(":")[1]; const p = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`; if (!existsSync(p)) return null; const data = JSON.parse(readFileSync(p, "utf8")); return data?.[sessionKey]?.sessionId || null; }
 function getLatestAssistantReply(sessionKey) { const sessionId = getSessionIdForKey(sessionKey); if (!sessionId) return null; const p = `${OPENCLAW_AGENTS_DIR}/${sessionKey.split(":")[1]}/sessions/${sessionId}.jsonl`; if (!existsSync(p)) return null; const raw = readFileSync(p, "utf8").trim(); if (!raw) return null; const lines = raw.split(/\r?\n/).reverse(); for (const line of lines) { try { const obj = JSON.parse(line); const msg = obj.message; if (msg?.role === "assistant" && Array.isArray(msg.content)) { const parts = msg.content.filter(c => c?.type === "text" && typeof c.text === "string").map(c => c.text.trim()).filter(Boolean); if (parts.length) return parts.join("\n"); } } catch {} } return null; }
@@ -811,7 +834,36 @@ const app = http.createServer(async (req, res) => {
   if (url.pathname === "/register" && req.method === "POST") { const body = JSON.parse((await parseBody(req)) || "{}"); const clientId = `mcp-${randomToken(12)}`; const clientSecret = randomToken(24); const record = { client_id: clientId, client_secret: clientSecret, client_id_issued_at: nowSeconds(), client_secret_expires_at: 0, redirect_uris: Array.isArray(body.redirect_uris) ? body.redirect_uris.filter(isValidRedirectUri) : [], grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: body.token_endpoint_auth_method || "client_secret_post", client_name: body.client_name || "Dynamic MCP Client" }; registeredClients.set(clientId, record); saveOauthState(); return jsonResponse(res, 201, record); }
   if (url.pathname === "/authorize" && req.method === "GET") { const clientId = url.searchParams.get("client_id") || ""; const redirectUri = url.searchParams.get("redirect_uri") || ""; const state = url.searchParams.get("state") || ""; const codeChallenge = url.searchParams.get("code_challenge") || ""; const codeChallengeMethod = url.searchParams.get("code_challenge_method") || ""; const responseType = url.searchParams.get("response_type") || ""; const client = registeredClients.get(clientId); if (!client || responseType !== "code" || !redirectUri || !isValidRedirectUri(redirectUri) || !codeChallenge || codeChallengeMethod !== "S256") return htmlResponse(res, 400, "<h1>Invalid OAuth request</h1>"); const TRUSTED_REDIRECT_ORIGINS = ["https://claude.ai"]; if (TRUSTED_REDIRECT_ORIGINS.some(o => redirectUri.startsWith(o))) { const code = randomToken(24); authCodes.set(code, { clientId, redirectUri, codeChallenge, expiresAt: nowSeconds() + 600 }); const redirect = new URL(redirectUri); redirect.searchParams.set("code", code); if (state) redirect.searchParams.set("state", state); res.writeHead(302, { Location: redirect.toString(), ...corsHeaders() }); return res.end(); } const form = `<!doctype html><html><body style="font-family:sans-serif;max-width:520px;margin:40px auto"><h1>Authorize Claude Connector</h1><p>Enter the MCP API key to approve access for <b>${client.client_name || clientId}</b>.</p><form method="POST" action="/authorize"><input type="hidden" name="client_id" value="${clientId}" /><input type="hidden" name="redirect_uri" value="${redirectUri}" /><input type="hidden" name="state" value="${state}" /><input type="hidden" name="code_challenge" value="${codeChallenge}" /><input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}" /><label>API key<br/><input type="password" name="api_key" style="width:100%;padding:8px" autofocus /></label><br/><br/><button type="submit">Approve</button></form></body></html>`; return htmlResponse(res, 200, form); }
   if (url.pathname === "/authorize" && req.method === "POST") { const form = parseForm(await parseBody(req)); logLine(`POST /authorize — client_id=${form.client_id}, redirect_uri=${form.redirect_uri}, api_key_provided=${!!form.api_key}, api_key_match=${form.api_key === API_KEY}`); const client = registeredClients.get(form.client_id || ""); if (!client || form.api_key !== API_KEY || !isValidRedirectUri(form.redirect_uri || "") || form.code_challenge_method !== "S256") return htmlResponse(res, 401, "<h1>Authorization failed</h1><p>Invalid API key or request.</p>"); const code = randomToken(24); authCodes.set(code, { clientId: form.client_id, redirectUri: form.redirect_uri, codeChallenge: form.code_challenge, expiresAt: nowSeconds() + 600 }); const redirect = new URL(form.redirect_uri); redirect.searchParams.set("code", code); if (form.state) redirect.searchParams.set("state", form.state); res.writeHead(302, { Location: redirect.toString(), ...corsHeaders() }); return res.end(); }
-  if (url.pathname === "/token" && req.method === "POST") { const form = parseForm(await parseBody(req)); logLine(`POST /token — grant_type=${form.grant_type}, client_id=${form.client_id}, code_present=${!!form.code}, verifier_present=${!!form.code_verifier}`); const clientId = form.client_id || ""; const client = registeredClients.get(clientId); if (!client) return jsonResponse(res, 401, { error: "invalid_client" }); const basic = req.headers.authorization || ""; const basicMatch = basic.startsWith("Basic ") ? Buffer.from(basic.slice(6), "base64").toString("utf8").split(":") : []; const presentedSecret = form.client_secret || basicMatch[1] || ""; const authMethod = client.token_endpoint_auth_method || "client_secret_post"; if (authMethod !== "none" && presentedSecret !== client.client_secret) return jsonResponse(res, 401, { error: "invalid_client" }); if (form.grant_type === "authorization_code") { const code = authCodes.get(form.code || ""); if (!code || code.expiresAt <= nowSeconds() || code.clientId !== clientId || code.redirectUri !== form.redirect_uri) return jsonResponse(res, 400, { error: "invalid_grant" }); if (!form.code_verifier || sha256Base64Url(form.code_verifier) !== code.codeChallenge) return jsonResponse(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" }); authCodes.delete(form.code); return jsonResponse(res, 200, issueAccessToken(clientId), { "Cache-Control": "no-store" }); } if (form.grant_type === "refresh_token") { const refresh = refreshTokens.get(form.refresh_token || ""); if (!refresh || refresh.clientId !== clientId || refresh.expiresAt <= nowSeconds()) return jsonResponse(res, 400, { error: "invalid_grant" }); return jsonResponse(res, 200, issueAccessToken(clientId), { "Cache-Control": "no-store" }); } return jsonResponse(res, 400, { error: "unsupported_grant_type" }); }
+  if (url.pathname === "/token" && req.method === "POST") {
+    const form = parseForm(await parseBody(req));
+    logLine(`POST /token — grant_type=${form.grant_type}, client_id=${form.client_id}, code_present=${!!form.code}, verifier_present=${!!form.code_verifier}`);
+    const clientId = form.client_id || "";
+    const client = registeredClients.get(clientId);
+    if (!client) return jsonResponse(res, 401, { error: "invalid_client" });
+    const basic = req.headers.authorization || "";
+    const basicMatch = basic.startsWith("Basic ") ? Buffer.from(basic.slice(6), "base64").toString("utf8").split(":") : [];
+    const presentedSecret = form.client_secret || basicMatch[1] || "";
+    const authMethod = client.token_endpoint_auth_method || "client_secret_post";
+    if (authMethod !== "none" && presentedSecret !== client.client_secret) return jsonResponse(res, 401, { error: "invalid_client" });
+    if (form.grant_type === "authorization_code") {
+      const code = authCodes.get(form.code || "");
+      if (!code || code.expiresAt <= nowSeconds() || code.clientId !== clientId || code.redirectUri !== form.redirect_uri) return jsonResponse(res, 400, { error: "invalid_grant" });
+      if (!form.code_verifier || sha256Base64Url(form.code_verifier) !== code.codeChallenge) return jsonResponse(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
+      authCodes.delete(form.code);
+      return jsonResponse(res, 200, issueAccessToken(clientId), { "Cache-Control": "no-store" });
+    }
+    if (form.grant_type === "refresh_token") {
+      const refreshToken = form.refresh_token || "";
+      try {
+        const tokenPair = await refreshAccessToken(clientId, refreshToken);
+        return jsonResponse(res, 200, tokenPair, { "Cache-Control": "no-store" });
+      } catch (error) {
+        if (error.message === "invalid_grant") return jsonResponse(res, 400, { error: "invalid_grant" });
+        throw error;
+      }
+    }
+    return jsonResponse(res, 400, { error: "unsupported_grant_type" });
+  }
   if (url.pathname !== "/mcp") return jsonResponse(res, 404, { error: "not found" });
   if (!requireMcpAuth(req, res)) return;
   try {
