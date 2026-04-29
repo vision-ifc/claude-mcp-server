@@ -83,6 +83,7 @@ const authCodes = new Map();
 const accessTokens = new Map();
 const refreshTokens = new Map();
 const refreshInFlight = new Map();
+const dispatchTimestamps = new Map();
 const registeredClients = new Map();
 const transports = new Map();
 const servers = new Map();
@@ -195,7 +196,7 @@ async function refreshAccessToken(clientId, refreshToken) {
 }
 function recordJob(job) { const full = { ...job, updatedAt: new Date().toISOString() }; jobs.set(job.id, full); return full; }
 function getSessionIdForKey(sessionKey) { const agentId = sessionKey.split(":")[1]; const p = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`; if (!existsSync(p)) return null; const data = JSON.parse(readFileSync(p, "utf8")); return data?.[sessionKey]?.sessionId || null; }
-function getLatestAssistantReply(sessionKey) { const sessionId = getSessionIdForKey(sessionKey); if (!sessionId) return null; const p = `${OPENCLAW_AGENTS_DIR}/${sessionKey.split(":")[1]}/sessions/${sessionId}.jsonl`; if (!existsSync(p)) return null; const raw = readFileSync(p, "utf8").trim(); if (!raw) return null; const lines = raw.split(/\r?\n/).reverse(); for (const line of lines) { try { const obj = JSON.parse(line); const msg = obj.message; if (msg?.role === "assistant" && Array.isArray(msg.content)) { const parts = msg.content.filter(c => c?.type === "text" && typeof c.text === "string").map(c => c.text.trim()).filter(Boolean); if (parts.length) return parts.join("\n"); } } catch {} } return null; }
+function getLatestAssistantReply(sessionKey) { const sessionId = getSessionIdForKey(sessionKey); if (!sessionId) return null; const p = `${OPENCLAW_AGENTS_DIR}/${sessionKey.split(":")[1]}/sessions/${sessionId}.jsonl`; if (!existsSync(p)) return null; const raw = readFileSync(p, "utf8").trim(); if (!raw) return null; const lines = raw.split(/\r?\n/).reverse(); for (const line of lines) { try { const obj = JSON.parse(line); const msg = obj.message; if (msg?.role === "assistant" && Array.isArray(msg.content)) { const parts = msg.content.filter(c => c?.type === "text" && typeof c.text === "string").map(c => c.text.trim()).filter(Boolean); if (parts.length) return { text: parts.join("\n"), timestamp: obj.timestamp || null }; } } catch {} } return null; }
 function readJsonFile(file, fallback) { try { if (!existsSync(file)) return fallback; return JSON.parse(readFileSync(file, "utf8")); } catch { return fallback; } }
 function isoOrNull(value) { if (!value) return null; const time = typeof value === "number" ? value : Date.parse(value); return Number.isFinite(time) ? new Date(time).toISOString() : null; }
 function readLatestAssistantText(sessionKey) {
@@ -206,10 +207,18 @@ function readLatestAssistantText(sessionKey) {
   const entry = sessions?.[sessionKey];
   const sessionId = entry?.sessionId || null;
   const sessionLastUpdated = isoOrNull(entry?.updatedAt || entry?.lastUpdated || entry?.endedAt || entry?.startedAt);
-  if (!sessionId) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated, reply: null, reason: "no_active_session" };
+  if (!sessionId) {
+    const lastDispatchMs = dispatchTimestamps.get(sessionKey);
+    if (lastDispatchMs) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated, status: "working", lastDispatchAt: new Date(lastDispatchMs).toISOString(), lastReplyAt: null, reply: null };
+    return { ok: true, sessionKey, sessionId: null, sessionLastUpdated, reply: null, reason: "no_active_session" };
+  }
   const canonicalTranscriptPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/${sessionId}.jsonl`;
   const transcriptPath = existsSync(canonicalTranscriptPath) ? canonicalTranscriptPath : entry?.sessionFile;
-  if (!transcriptPath || !existsSync(transcriptPath)) return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_transcript" };
+  if (!transcriptPath || !existsSync(transcriptPath)) {
+    const lastDispatchMs = dispatchTimestamps.get(sessionKey);
+    if (lastDispatchMs) return { ok: true, sessionKey, sessionId, sessionLastUpdated, status: "working", lastDispatchAt: new Date(lastDispatchMs).toISOString(), lastReplyAt: null, reply: null };
+    return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_transcript" };
+  }
   const raw = tailReadFile(transcriptPath, 262144);
   const lines = raw.split(/\r?\n/).filter(line => line.trim());
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -218,9 +227,18 @@ function readLatestAssistantText(sessionKey) {
       const msg = obj.message;
       if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
       const parts = msg.content.filter(part => part?.type === "text" && typeof part.text === "string" && part.text.trim()).map(part => part.text.trim());
-      if (parts.length) return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: redactSecrets(parts.join("\n")) };
+      if (parts.length) {
+        const reply = { text: redactSecrets(parts.join("\n")), timestamp: obj.timestamp || null };
+        const lastDispatchMs = dispatchTimestamps.get(sessionKey);
+        const replyMs = Date.parse(reply.timestamp || "");
+        if (lastDispatchMs && (!Number.isFinite(replyMs) || lastDispatchMs > replyMs)) return { ok: true, sessionKey, sessionId, sessionLastUpdated, status: "working", lastDispatchAt: new Date(lastDispatchMs).toISOString(), lastReplyAt: Number.isFinite(replyMs) ? new Date(replyMs).toISOString() : null, reply: null };
+        if (lastDispatchMs && Number.isFinite(replyMs) && replyMs >= lastDispatchMs) dispatchTimestamps.delete(sessionKey);
+        return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: reply.text };
+      }
     } catch {}
   }
+  const lastDispatchMs = dispatchTimestamps.get(sessionKey);
+  if (lastDispatchMs) return { ok: true, sessionKey, sessionId, sessionLastUpdated, status: "working", lastDispatchAt: new Date(lastDispatchMs).toISOString(), lastReplyAt: null, reply: null };
   return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_new_reply" };
 }
 function listAgentStatuses() { if (!existsSync(AGENT_STATUS_DIR)) return []; return readdirSync(AGENT_STATUS_DIR).filter(name => name.endsWith('.json')).map(name => readJsonFile(`${AGENT_STATUS_DIR}/${name}`, null)).filter(Boolean); }
@@ -433,7 +451,7 @@ ${kick.stdout}`;
   if (/Could not find service|service not loaded/i.test(err)) return bootoutBootstrapService(service, plistPath, oldPid);
   return { ok: false, status: "failed", method: "kickstart", service, oldPid, newPid, error: kick.stderr || kick.stdout || "kickstart failed" };
 }
-async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply && reply !== previousReply) return reply; await sleep(2000); } return null; }
+async function waitForAgentReply(sessionKey, previousReply, timeoutMs) { const started = Date.now(); while (Date.now() - started < timeoutMs) { const reply = getLatestAssistantReply(sessionKey); if (reply?.text && reply.text !== previousReply) return reply.text; await sleep(2000); } return null; }
 function updateAgentStatus(agentId, status, task) {
   try {
     spawn("bash", ["/Users/jarvis/.openclaw/workspace-yoda/scripts/update-agent-status.sh", "--agent", agentId, "--status", status, "--task", task], { stdio: "ignore", detached: true }).unref();
@@ -706,7 +724,7 @@ function runEmbeddedAgent(agentId, task, timeoutMs = 60000) {
 async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKey, waitForReply = true, timeoutMs = 30000 }) {
   const jobId = randomUUID();
   const key = sessionKey || `agent:${agentId}:main`;
-  const previousReply = getLatestAssistantReply(key);
+  const previousReply = getLatestAssistantReply(key)?.text || null;
   const params = { key, message: task };
   recordJob({ id: jobId, type: "dispatch_agent", status: "running", request: params });
   const taskMatch = task.match(/\b(IFC-\d+)\b/);
@@ -716,6 +734,10 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
     let raw, reply = null;
     try {
       raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 30000));
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed?.status === "started") dispatchTimestamps.set(key, Date.now());
+      } catch {}
       reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
     } catch (gatewayError) {
       if (waitForReply) {
