@@ -735,9 +735,14 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
     try {
       raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 30000));
       try {
-        const parsed = JSON.parse(raw);
-        if (parsed?.status === "started") dispatchTimestamps.set(key, Date.now());
-      } catch {}
+        const jsonStart = raw.indexOf("{");
+        if (jsonStart >= 0) {
+          const parsed = JSON.parse(raw.slice(jsonStart));
+          if (parsed?.status === "started") dispatchTimestamps.set(key, Date.now());
+        }
+      } catch (e) {
+        logLine(`WARN dispatchTimestamps parse failed key=${key} err=${e.message}`);
+      }
       reply = waitForReply ? await waitForAgentReply(key, previousReply, timeoutMs) : null;
     } catch (gatewayError) {
       if (waitForReply) {
