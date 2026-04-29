@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
 import { hostname, homedir, userInfo } from "node:os";
-import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, writeSync, fsyncSync, closeSync, unlinkSync } from "node:fs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,7 +15,7 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://${HOST}:${PORT}`
 const API_KEY = process.env.MCP_API_KEY || "";
 const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || "";
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || "";
-const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 2592000);
+const OAUTH_ACCESS_TOKEN_TTL_SECONDS = Number(process.env.OAUTH_ACCESS_TOKEN_TTL_SECONDS || 3600);
 const OPENCLAW_BASE_URL = (process.env.OPENCLAW_BASE_URL || "ws://127.0.0.1:18789").replace(/\/$/, "");
 const OPENCLAW_TOKEN = process.env.OPENCLAW_TOKEN || "";
 const OPENCLAW_CODING_BASE_URL = (process.env.OPENCLAW_CODING_BASE_URL || "").replace(/\/$/, "");
@@ -109,7 +109,22 @@ function saveOauthState() {
     accessTokens: Array.from(accessTokens.entries()),
     refreshTokens: Array.from(refreshTokens.entries())
   };
-  writeFileSync(OAUTH_STATE_FILE, JSON.stringify(state, null, 2));
+  const tmpFile = `${OAUTH_STATE_FILE}.tmp`;
+  let fd;
+  try {
+    fd = openSync(tmpFile, "w");
+    writeSync(fd, JSON.stringify(state, null, 2));
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmpFile, OAUTH_STATE_FILE);
+  } catch (e) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch {}
+    }
+    try { unlinkSync(tmpFile); } catch {}
+    throw e;
+  }
 }
 
 function loadOauthState() {
