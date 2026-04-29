@@ -92,7 +92,7 @@ function runGatewayCall(method, params = {}, expectFinal = false, timeoutMs = 30
 
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(30000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(120000) }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
     const jobId = randomUUID();
     const key = sessionKey || `agent:${agentId}:main`;
     const previousReply = getLatestAssistantReply(key);
