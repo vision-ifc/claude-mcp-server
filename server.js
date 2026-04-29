@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import http from "node:http";
 import { hostname, homedir, userInfo } from "node:os";
-import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, writeFileSync, readdirSync, renameSync, openSync, fstatSync, readSync, writeSync, fsyncSync, closeSync, unlinkSync } from "node:fs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { LinearClient } from "@linear/sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -109,7 +109,22 @@ function saveOauthState() {
     accessTokens: Array.from(accessTokens.entries()),
     refreshTokens: Array.from(refreshTokens.entries())
   };
-  writeFileSync(OAUTH_STATE_FILE, JSON.stringify(state, null, 2));
+  const tmpFile = `${OAUTH_STATE_FILE}.tmp`;
+  let fd;
+  try {
+    fd = openSync(tmpFile, "w");
+    writeSync(fd, JSON.stringify(state, null, 2));
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmpFile, OAUTH_STATE_FILE);
+  } catch (e) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch {}
+    }
+    try { unlinkSync(tmpFile); } catch {}
+    throw e;
+  }
 }
 
 function loadOauthState() {
