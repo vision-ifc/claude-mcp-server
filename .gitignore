@@ -1,2 +1,9 @@
 .env
 node_modules/
+.oauth-state.json
+.oauth-state.json.preserve
+.oauth-state.json.preserve.predeploy-*
+.oauth-state.json.broken
+.oauth-state.json.bak*
+server.js.bak*
+.tasks.json
