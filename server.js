@@ -161,6 +161,42 @@ function readLatestAssistantText(sessionKey) {
   }
   return { ok: true, sessionKey, sessionId, sessionLastUpdated, reply: null, reason: "no_new_reply" };
 }
+function readSessionHistory(sessionKey, limit = 20, includeTools = true) {
+  const cap = Math.max(1, Math.min(Number(limit) || 20, 100));
+  const agentId = sessionKey?.split(":")?.[1];
+  if (!agentId) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated: null, entries: [], reason: "no_active_session" };
+  const sessionsPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/sessions.json`;
+  const sessions = readJsonFile(sessionsPath, null);
+  const entry = sessions?.[sessionKey];
+  const sessionId = entry?.sessionId || null;
+  const sessionLastUpdated = isoOrNull(entry?.updatedAt || entry?.lastUpdated || entry?.endedAt || entry?.startedAt);
+  if (!sessionId) return { ok: true, sessionKey, sessionId: null, sessionLastUpdated, entries: [], reason: "no_active_session" };
+  const canonicalTranscriptPath = `${OPENCLAW_AGENTS_DIR}/${agentId}/sessions/${sessionId}.jsonl`;
+  const transcriptPath = existsSync(canonicalTranscriptPath) ? canonicalTranscriptPath : entry?.sessionFile;
+  if (!transcriptPath || !existsSync(transcriptPath)) return { ok: true, sessionKey, sessionId, sessionLastUpdated, entries: [], reason: "no_transcript" };
+  const raw = tailReadFile(transcriptPath, 524288);
+  const lines = raw.split(/\r?\n/).filter(line => line.trim());
+  const collected = [];
+  for (let i = lines.length - 1; i >= 0 && collected.length < cap; i--) {
+    try {
+      const obj = JSON.parse(lines[i]);
+      const msg = obj.message;
+      if (!msg?.role || !Array.isArray(msg.content)) continue;
+      const types = msg.content.map(part => part?.type).filter(Boolean);
+      if (!includeTools && (types.includes("toolCall") || types.includes("toolResult") || msg.role === "toolResult")) continue;
+      const previewParts = msg.content.map(part => {
+        if (part?.type === "text" && typeof part.text === "string") return part.text;
+        if (part?.type === "thinking" && typeof part.thinking === "string") return `[thinking: ${part.thinking}]`;
+        if (part?.type === "toolCall" && part?.name) return `[tool: ${part.name}${part?.input ? " " + JSON.stringify(part.input).slice(0, 200) : ""}]`;
+        if (part?.type === "toolResult") return "[toolResult]";
+        return "";
+      }).filter(Boolean).join(" | ");
+      const preview = redactSecrets(previewParts).slice(0, 500);
+      collected.push({ ts: isoOrNull(obj.timestamp), role: msg.role, types, preview: preview + (previewParts.length > 500 ? "..." : "") });
+    } catch {}
+  }
+  return { ok: true, sessionKey, sessionId, sessionLastUpdated, entries: collected.reverse() };
+}
 function listAgentStatuses() { if (!existsSync(AGENT_STATUS_DIR)) return []; return readdirSync(AGENT_STATUS_DIR).filter(name => name.endsWith('.json')).map(name => readJsonFile(`${AGENT_STATUS_DIR}/${name}`, null)).filter(Boolean); }
 function getCompletions(agent) { const completions = readJsonFile(AGENT_COMPLETIONS_FILE, []); const filtered = agent ? completions.filter(entry => entry?.agent === agent) : completions; return filtered.sort((a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()); }
 
@@ -680,6 +716,7 @@ async function directToolCall(name, args = {}) {
   if (name === "list_agents") return { ok: true, agents: listAgentStatuses() };
   if (name === "get_completions") return { ok: true, completions: getCompletions(args.agent) };
   if (name === "get_agent_output") return readLatestAssistantText(args.sessionKey);
+  if (name === "get_session_history") return readSessionHistory(args.sessionKey, args.limit, args.includeTools);
   if (name === "jarvis_restart_service") return restartServiceImpl(args.service, args.mode || "kickstart");
   if (name === "dispatch_agent") return dispatchAgentDirect(args);
   return { ok: false, error: `unknown tool: ${name}` };
@@ -774,6 +811,10 @@ See docs/yoda/dispatch-agent-pattern.md in plat-docs for full rationale and exam
   server.tool("get_agent_output", "Get the latest assistant reply for an agent session.", { sessionKey: z.string() }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ sessionKey }) => {
     const result = readLatestAssistantText(sessionKey);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  });
+  server.tool("get_session_history", "Read recent entries from an agent's session transcript. Surfaces tool_use blocks, tool_results, and intermediate assistant turns that get_agent_output does not show. Use this when an agent appears idle but you suspect it's mid-task. Read-only.", { sessionKey: z.string(), limit: z.number().int().positive().max(100).optional().default(20), includeTools: z.boolean().optional().default(true) }, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }, async ({ sessionKey, limit, includeTools }) => {
+    const result = readSessionHistory(sessionKey, limit, includeTools);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
   });
   return server;
 }
