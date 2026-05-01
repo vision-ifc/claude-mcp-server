@@ -660,7 +660,7 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
     let raw, reply = null;
     try {
       // Gateway send only confirms delivery. Keep this short to avoid known openclaw CLI timeout bugs (#59470/#31489).
-      raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 10000));
+      raw = await runGatewayCall("sessions.send", params, false, Math.min(timeoutMs, 30000));
       if (!raw.includes("messageSeq")) throw new Error(`gateway response missing messageSeq: ${raw}`);
     } catch (gatewayError) {
       throw new Error(`dispatch_agent message delivery failed via openclaw gateway call (see openclaw#59470): ${gatewayError.message}`);
