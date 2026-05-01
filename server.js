@@ -255,9 +255,23 @@ function redactJarvisStatusString(value, extraSecrets = []) {
     .replace(/xapp-[A-Za-z0-9_-]+/g, "[REDACTED:slack-token]")
     .replace(/[0-9]{8,12}:[A-Za-z0-9_-]{30,}/g, "[REDACTED:telegram-token]")
     .replace(/bearer\s+[A-Za-z0-9._-]+/gi, "[REDACTED:bearer]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, "Bearer [REDACTED]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED:jwt]")
+    .replaceAll("/Users/jarvis/", "~/")
     .replace(/(secret|password|token|api[_-]?key)["':=\s]+["']?[A-Za-z0-9_/+\-=.]{12,}["']?/gi, "[REDACTED:credential]");
 }
 function redactSecrets(value, extraSecrets = []) { return redactJarvisStatusString(value, extraSecrets); }
+function dispatchAgentErrorResult(errorObject) {
+  return { content: [{ type: "text", text: JSON.stringify(errorObject, null, 2) }], isError: true };
+}
+function dispatchAgentFailure({ jobId, error, gateway, request_id }) {
+  const result = { ok: false };
+  if (jobId) result.jobId = jobId;
+  result.error = redactSecrets(error?.message || error || "dispatch_agent failed");
+  if (gateway) result.gateway = gateway;
+  if (request_id !== undefined && request_id !== null) result.request_id = request_id;
+  return result;
+}
 
 function runReadOnlyCommand(command, args, timeoutMs = 2000) {
   const commandResult = new Promise(resolve => {
@@ -759,9 +773,10 @@ async function dispatchAgentDirect({ agentId = DEFAULT_AGENT_ID, task, sessionKe
     updateAgentStatus(agentId, "idle", taskLabel);
     return { ok: true, jobId, sessionKey: key, reply, raw: job.raw };
   } catch (error) {
-    recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: error.message });
+    const failure = dispatchAgentFailure({ jobId, error });
+    recordJob({ id: jobId, type: "dispatch_agent", status: "failed", request: params, error: failure.error });
     updateAgentStatus(agentId, "idle", taskLabel);
-    return { ok: false, jobId, error: error.message };
+    return failure;
   }
 }
 
@@ -796,8 +811,12 @@ function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
   server.server.registerCapabilities({ tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } });
   server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(1800000).default(30000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
-    const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
+    try {
+      const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
+    } catch (error) {
+      return dispatchAgentErrorResult(dispatchAgentFailure({ error }));
+    }
   });
   server.tool("tasks_get", "Get metadata for a SEP-1686 task by taskId.", { taskId: z.string().min(1) }, async ({ taskId }, extra) => callTaskRpcTool("tasks/get", { taskId }, extra));
   server.tool("tasks_list", "List SEP-1686 tasks visible to this client.", { cursor: z.string().optional() }, async ({ cursor }, extra) => callTaskRpcTool("tasks/list", { cursor }, extra));
@@ -882,6 +901,7 @@ async function getTransport(req, parsedBody) {
 const app = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", PUBLIC_BASE_URL);
   const sessionId = req.headers["mcp-session-id"];
+  let parsedRpcBody = null;
   logLine(`${req.method} ${url.pathname} from ${req.headers["x-forwarded-for"] || req.socket.remoteAddress} | UA: ${(req.headers["user-agent"] || "").slice(0, 120)}`);
   if (req.method === "OPTIONS") { res.writeHead(204, corsHeaders({ "Access-Control-Max-Age": "86400" })); return res.end(); }
   if (url.pathname === "/healthz") return jsonResponse(res, 200, { ok: true, service: "jarvis-openclaw-mcp", openclawPort: OPENCLAW_PORT, codingPort: OPENCLAW_CODING_PORT || null, codingAgents: Array.from(CODING_GATEWAY_AGENTS), oauth: true });
@@ -937,12 +957,19 @@ const app = http.createServer(async (req, res) => {
       if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null });
       await transport.handleRequest(req, res); return;
     }
-    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext, sessionId); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
+    if (req.method === "POST") { const bodyText = await parseBody(req); const body = bodyText ? JSON.parse(bodyText) : {}; parsedRpcBody = body; logLine(`POST /mcp body: ${JSON.stringify(body).slice(0, 2000)}`); const authContext = getAuthContext(req); const taskRpc = await handleTaskRpc(body, authContext, sessionId); if (taskRpc) return jsonResponse(res, taskRpc.error ? 400 : 200, taskRpc); if (!sessionId && body?.method === "tools/call") { const result = await directToolCall(body.params?.name, body.params?.arguments || {}); return jsonResponse(res, 200, { result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: result?.ok === false || undefined }, jsonrpc: "2.0", id: body.id ?? null }); } const transport = await getTransport(req, body); if (!transport) return jsonResponse(res, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Bad Request: No valid session ID provided" }, id: null }); await transport.handleRequest(req, res, body); return; }
     return jsonResponse(res, 405, { error: "method not allowed" }, { Allow: "GET, POST, DELETE, OPTIONS" });
   } catch (error) {
     logLine(`MCP handler error: ${error.stack || error.message}`);
     if (sessionId) activeSseBySession.delete(sessionId);
-    return jsonResponse(res, 500, { error: error.message });
+    if (parsedRpcBody?.method === "tools/call" && parsedRpcBody?.params?.name === "dispatch_agent") {
+      return jsonResponse(res, 200, {
+        result: dispatchAgentErrorResult(dispatchAgentFailure({ error, request_id: parsedRpcBody.id })),
+        jsonrpc: "2.0",
+        id: parsedRpcBody.id ?? null
+      });
+    }
+    return jsonResponse(res, 500, { error: redactSecrets(error.message) });
   }
 });
 
