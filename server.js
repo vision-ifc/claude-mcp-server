@@ -706,7 +706,11 @@ async function callTaskRpcTool(method, params = {}, extra = {}) {
 function buildServer() {
   const server = new McpServer({ name: "jarvis-openclaw-mcp", version: "0.5.0" });
   server.server.registerCapabilities({ tasks: { list: {}, cancel: {}, requests: { tools: { call: {} } } } });
-  server.tool("dispatch_agent", "Dispatch a task to an OpenClaw agent/sub-agent. All session dispatches go through the main gateway (18789) where agent sessions live.", { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(true), timeoutMs: z.number().int().positive().max(120000).default(120000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
+  server.tool("dispatch_agent", `Dispatches a task to an OpenClaw agent (Artoo, ThreePo, etc.). Returns immediately by default with a structured shape ({ok, jobId, ...}); poll get_agent_output to retrieve the agent reply when it lands.
+
+Default behavior is fire-and-forget + poll, which is the recommended pattern for any task expected to take longer than a few seconds. Set waitForReply: true ONLY for tasks expected to complete in under 10 seconds (e.g., smoke tests, PING/PONG health checks). Long-running synchronous calls (60s+) will trigger claude.ai web hardcoded ~60s MCP transport timeout and return an opaque error.
+
+See docs/yoda/dispatch-agent-pattern.md in plat-docs for full rationale and examples.`, { agentId: z.string().default(DEFAULT_AGENT_ID), task: z.string().min(1), sessionKey: z.string().optional(), waitForReply: z.boolean().default(false), timeoutMs: z.number().int().positive().max(120000).default(45000) }, { taskHint: "optional" }, async ({ agentId, task, sessionKey, waitForReply, timeoutMs }) => {
     const result = await dispatchAgentDirect({ agentId, task, sessionKey, waitForReply, timeoutMs });
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: !result.ok || undefined };
   });
